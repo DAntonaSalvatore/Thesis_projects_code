@@ -3211,3 +3211,1458 @@ cat("\nResults saved to:\n")
 
 # FINE PARTE FENOTIPO CONTINUO
 # INIZIO PARTE FENOTIPO BINARIO
+
+##Feature selection
+setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\richiesta_dati_reali\\EGAD00000000003_decriptati\\effettivamente_utili")
+
+# 1. Load required libraries
+library(data.table)
+library(nestedcv)
+library(glmnet)
+library(pROC)
+
+# ====================================================================
+# 2. Load data
+# ====================================================================
+setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\richiesta_dati_reali\\EGAD00000000003_decriptati\\effettivamente_utili")
+
+final_df <- fread("FINAL_shuffled_CASI_E_CONTROLLI_BD_58C_chr22.txt")
+
+# ====================================================================
+# 3. Extract phenotype and convert to numeric 0/1
+# ====================================================================
+# The 2nd column contains the phenotype (already 0/1 as per your check)
+y <- as.numeric(final_df[[2]])   # numeric 0 and 1
+
+# Double‑check that y is indeed 0/1
+if (!all(y %in% c(0, 1))) {
+  stop("Phenotype must contain only 0 and 1.")
+}
+cat("Phenotype distribution:\n")
+print(table(y))
+
+# ====================================================================
+# 4. Train / Test split (80/20)
+# ====================================================================
+set.seed(123)
+n <- nrow(final_df)
+train_idx <- sample(seq_len(n), size = floor(0.8 * n))
+test_idx  <- setdiff(seq_len(n), train_idx)
+
+# Training and test data frames (full rows)
+train_df <- final_df[train_idx, ]
+test_df  <- final_df[test_idx, ]
+
+# Separate y and X (SNPs start at column 3)
+y_train <- y[train_idx]
+y_test  <- y[test_idx]
+
+X_train <- as.matrix(train_df[, 3:ncol(train_df), with = FALSE])
+X_test  <- as.matrix(test_df[,  3:ncol(test_df),  with = FALSE])
+
+# Force numeric (just in case)
+X_train <- apply(X_train, 2, as.numeric)
+X_test  <- apply(X_test,  2, as.numeric)
+
+# ====================================================================
+# 5. Remove zero‑variance SNPs (and any constant columns)
+# ====================================================================
+train_var <- apply(X_train, 2, var, na.rm = TRUE)
+zero_var   <- which(is.na(train_var) | train_var == 0)
+
+if (length(zero_var) > 0) {
+  cat("Removing", length(zero_var), "zero‑variance SNPs.\n")
+  X_train <- X_train[, -zero_var, drop = FALSE]
+  X_test  <- X_test[,  -zero_var, drop = FALSE]
+}
+
+cat("Number of SNPs retained:", ncol(X_train), "\n")
+
+# ====================================================================
+# 6. Check for missing/infinite values
+# ====================================================================
+if (any(!is.finite(X_train))) stop("X_train contains NA/NaN/Inf.")
+if (any(!is.finite(X_test)))  stop("X_test contains NA/NaN/Inf.")
+
+# ====================================================================
+# 7. Nested CV LASSO (binomial) – feature selection
+# ====================================================================
+# IMPORTANT: for binomial family, y must be a factor
+y_train_factor <- factor(y_train, levels = c(0, 1))
+y_test_factor  <- factor(y_test,  levels = c(0, 1))
+
+set.seed(123)
+fit <- nestcv.glmnet(
+  x = X_train,
+  y = y_train_factor,               # factor with levels 0,1
+  family = "binomial",
+  alpha = 1,
+  outer_k = 10,
+  inner_k = 10,
+  min_1se = 1,
+  type.measure = "auc"              # use AUC for inner CV; can also use "deviance"
+)
+
+# ====================================================================
+# 8. Extract selected SNPs (coefficients != 0)
+# ====================================================================
+coef_mat <- fit$final_coef
+features_selected <- rownames(coef_mat)[coef_mat[, 1] != 0]
+features_selected <- setdiff(features_selected, "(Intercept)")
+
+cat("\nNumber of selected features:", length(features_selected), "\n")
+
+# ====================================================================
+# 9. Build reduced datasets using only selected SNPs
+# ====================================================================
+X_train_fs <- X_train[, features_selected, drop = FALSE]
+X_test_fs  <- X_test[,  features_selected, drop = FALSE]
+
+# Create data frames for logistic regression
+df_train_fs <- as.data.frame(X_train_fs)
+df_train_fs$y <- y_train
+
+df_test_fs <- as.data.frame(X_test_fs)
+df_test_fs$y <- y_test
+
+# ====================================================================
+# SAVE REDUCED DATASETS AND SELECTED SNPS
+# ====================================================================
+
+# 1. Save reduced data frames (selected SNPs + phenotype)
+# ------------------------------------------
+# CSV format (human‑readable, portable)
+write.csv(df_train_fs, file = "train_selected_SNPs.csv", row.names = FALSE)
+write.csv(df_test_fs,  file = "test_selected_SNPs.csv",  row.names = FALSE)
+
+# Optional: also save as RData to preserve column classes
+# save(df_train_fs, df_test_fs, file = "selected_datasets.RData")
+
+# 2. Save the list of selected SNP names
+# ------------------------------------------
+# Plain text (one per line)
+writeLines(features_selected, con = "selected_SNPs.txt")
+
+# R binary format (for easy reloading in R)
+saveRDS(features_selected, file = "selected_SNPs.rds")
+
+# 3. (Optional) Save train/test indices for reproducibility
+# ------------------------------------------
+saveRDS(list(train_idx = train_idx, test_idx = test_idx), 
+        file = "train_test_indices.rds")
+
+cat("\nAll files saved successfully.\n")
+
+
+##
+## LOGISTIC REGRESSION
+##
+library(pROC)
+
+features_selected <- read.delim("selected_SNPs.txt", header = F,
+                                stringsAsFactors = FALSE)
+df_train_fs <- read.csv("train_selected_SNPs.csv")
+df_test_fs <- read.csv("test_selected_SNPs.csv")
+
+
+
+# Check number of selected SNPs
+cat("Number of selected SNPs:", length(features_selected), "\n")
+
+if (length(features_selected) == 0) {
+  stop("No SNPs were selected by LASSO.")
+}
+
+
+# --------------------------------------------------------------------
+# Create logistic regression formula
+# --------------------------------------------------------------------
+features_selected <- features_selected$V1
+
+logistic_formula <- reformulate(
+  features_selected,
+  response = "y"
+)
+
+
+cat("\nLogistic regression formula:\n")
+
+
+# --------------------------------------------------------------------
+# Fit logistic regression on TRAINING data only
+# --------------------------------------------------------------------
+
+logistic_model <- glm(
+  formula = logistic_formula,
+  data = df_train_fs,
+  family = binomial(link = "logit")
+)
+
+cat("\nLogistic regression fitted successfully.\n")
+
+# ====================================================================
+# 10B. EXTRACT LOGISTIC REGRESSION MATHEMATICAL FORMULA
+# ====================================================================
+
+cat("\n============================================\n")
+
+
+cat("LOGISTIC REGRESSION MATHEMATICAL FORMULA\n")
+cat("============================================\n")
+
+
+# Extract coefficients
+coef_logistic <- coef(logistic_model)
+
+# Intercept
+intercept <- unname(coef_logistic["(Intercept)"])
+
+# SNP coefficients
+beta <- coef_logistic[names(coef_logistic) != "(Intercept)"]
+
+
+# --------------------------------------------------------------------
+# Create the linear predictor formula
+# --------------------------------------------------------------------
+
+formula_terms <- paste0(
+  sprintf("%.10f", beta),
+  " * ",
+  names(beta)
+)
+
+linear_formula <- paste(
+  c(sprintf("%.10f", intercept), formula_terms),
+  collapse = " + "
+)
+
+# Replace "+ -" with "- " for negative coefficients
+linear_formula <- gsub(
+  "\\+ -",
+  "- ",
+  linear_formula
+)
+
+cat("\nLinear predictor (log-odds) formula:\n\n")
+
+
+cat("eta = ", linear_formula, "\n", sep = "")
+
+
+# --------------------------------------------------------------------
+# Create probability formula
+# --------------------------------------------------------------------
+
+cat("\nProbability formula:\n\n")
+
+
+
+cat(
+  "p = 1 / (1 + exp(-eta))\n"
+)
+
+cat("\nwhere eta is:\n\n")
+
+
+cat(
+  "eta = ",
+  linear_formula,
+  "\n",
+  sep = ""
+)
+
+
+# --------------------------------------------------------------------
+# Save coefficients
+# --------------------------------------------------------------------
+
+logistic_coefficients <- data.frame(
+  Variable = names(coef_logistic),
+  Coefficient = as.numeric(coef_logistic),
+  Odds_Ratio = exp(as.numeric(coef_logistic))
+)
+
+write.csv(
+  logistic_coefficients,
+  "logistic_regression_coefficients.csv",
+  row.names = FALSE
+)
+
+
+# ====================================================================
+# 11. PREDICT PROBABILITIES
+# ====================================================================
+
+# IMPORTANT:
+# type = "response" gives probabilities between 0 and 1
+
+p_train <- predict(
+  logistic_model,
+  newdata = df_train_fs,
+  type = "response"
+)
+
+p_test <- predict(
+  logistic_model,
+  newdata = df_test_fs,
+  type = "response"
+)
+
+
+# Check predictions
+cat("\nTraining predicted probabilities:\n")
+
+print(head(p_train))
+
+
+cat("\nTesting predicted probabilities:\n")
+
+print(head(p_test))
+
+
+# ====================================================================
+# 12. AUC-ROC
+# ====================================================================
+
+roc_train <- roc(
+  response = df_train_fs$y,
+  predictor = p_train,
+  quiet = TRUE
+)
+
+roc_test <- roc(
+  response = df_test_fs$y,
+  predictor = p_test,
+  quiet = TRUE
+)
+
+auc_train <- as.numeric(auc(roc_train))
+auc_test  <- as.numeric(auc(roc_test))
+
+
+# ====================================================================
+# 13. BRIER SCORE
+# ====================================================================
+
+# Brier score:
+#
+#       1
+# BS = --- sum((y - p)^2)
+#       n
+
+brier_score <- function(obs, pred) {
+  
+  mean((obs - pred)^2)
+}
+
+brier_train <- brier_score(
+  df_train_fs$y,
+  p_train
+)
+
+brier_test <- brier_score(
+  df_test_fs$y,
+  p_test
+)
+
+
+# ====================================================================
+# 14. LOG LOSS
+# ====================================================================
+
+# Log loss:
+#
+#        1
+# LL = - - sum[y log(p) + (1-y) log(1-p)]
+#        n
+
+log_loss <- function(obs, pred) {
+  
+  # Prevent log(0)
+  eps <- 1e-15
+  
+  pred <- pmin(
+    pmax(pred, eps),
+    1 - eps
+  )
+  
+  -mean(
+    obs * log(pred) +
+      (1 - obs) * log(1 - pred)
+  )
+}
+
+logloss_train <- log_loss(
+  df_train_fs$y,
+  p_train
+)
+
+logloss_test <- log_loss(
+  df_test_fs$y,
+  p_test
+)
+
+
+# ====================================================================
+# 15. COMBINE PERFORMANCE RESULTS
+# ====================================================================
+
+performance <- data.frame(
+  
+  Dataset = c(
+    "Training",
+    "Testing"
+  ),
+  
+  AUC_ROC = c(
+    auc_train,
+    auc_test
+  ),
+  
+  Brier_Score = c(
+    brier_train,
+    brier_test
+  ),
+  
+  Log_Loss = c(
+    logloss_train,
+    logloss_test
+  )
+)
+
+
+# Print results
+cat("\n============================================\n")
+
+
+cat("LOGISTIC REGRESSION PERFORMANCE\n")
+cat("============================================\n")
+
+print(performance)
+
+
+
+
+# ====================================================================
+# DECISION TREE - BINARY PHENOTYPE
+# Same SNPs selected by LASSO
+# Metrics: AUC-ROC, Brier Score, Log Loss
+# Also extracts the classification rules used by the tree
+# ====================================================================
+
+setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\richiesta_dati_reali\\EGAD00000000003_decriptati\\effettivamente_utili")
+
+
+# ====================================================================
+# 1. LOAD LIBRARIES
+# ====================================================================
+
+library(data.table)
+library(rpart)
+library(rpart.plot)
+library(pROC)
+
+
+# ====================================================================
+# 2. LOAD SELECTED SNPs AND DATA
+# ====================================================================
+
+features_selected <- read.delim(
+  "selected_SNPs.txt",
+  header = FALSE,
+  stringsAsFactors = FALSE
+)
+
+# Convert data frame -> character vector
+features_selected <- features_selected$V1
+
+df_train_fs <- read.csv(
+  "train_selected_SNPs.csv",
+  stringsAsFactors = FALSE
+)
+
+df_test_fs <- read.csv(
+  "test_selected_SNPs.csv",
+  stringsAsFactors = FALSE
+)
+
+
+# ====================================================================
+# 3. CHECK DATA
+# ====================================================================
+
+cat("\n============================================\n")
+cat("DATA CHECK\n")
+cat("============================================\n")
+
+cat("Number of selected SNPs:", length(features_selected), "\n")
+
+if (length(features_selected) == 0) {
+  stop("No SNPs were selected.")
+}
+
+# Check that all selected SNPs are present
+missing_train <- setdiff(
+  features_selected,
+  names(df_train_fs)
+)
+
+missing_test <- setdiff(
+  features_selected,
+  names(df_test_fs)
+)
+
+if (length(missing_train) > 0) {
+  stop(
+    "The following SNPs are missing from training data:\n",
+    paste(missing_train, collapse = ", ")
+  )
+}
+
+if (length(missing_test) > 0) {
+  stop(
+    "The following SNPs are missing from testing data:\n",
+    paste(missing_test, collapse = ", ")
+  )
+}
+
+
+# Check phenotype
+if (!"y" %in% names(df_train_fs)) {
+  stop("Column 'y' not found in training data.")
+}
+
+if (!"y" %in% names(df_test_fs)) {
+  stop("Column 'y' not found in testing data.")
+}
+
+if (!all(df_train_fs$y %in% c(0, 1))) {
+  stop("Training phenotype y must contain only 0 and 1.")
+}
+
+if (!all(df_test_fs$y %in% c(0, 1))) {
+  stop("Testing phenotype y must contain only 0 and 1.")
+}
+
+
+cat("\nTraining phenotype:\n")
+print(table(df_train_fs$y))
+
+cat("\nTesting phenotype:\n")
+print(table(df_test_fs$y))
+
+
+# ====================================================================
+# 4. CONVERT PHENOTYPE TO FACTOR
+# ====================================================================
+#
+# For rpart classification:
+#
+# 0 = Control
+# 1 = Case
+#
+# We explicitly define the levels so that the probability
+# extracted from predict(..., type = "prob") corresponds to class 1.
+# ====================================================================
+
+df_train_fs$y_factor <- factor(
+  df_train_fs$y,
+  levels = c(0, 1),
+  labels = c("Control", "Case")
+)
+
+df_test_fs$y_factor <- factor(
+  df_test_fs$y,
+  levels = c(0, 1),
+  labels = c("Control", "Case")
+)
+
+
+# ====================================================================
+# 5. KEEP ONLY VARIABLES USED BY THE TREE
+# ====================================================================
+
+tree_train <- df_train_fs[
+  ,
+  c("y_factor", features_selected)
+]
+
+tree_test <- df_test_fs[
+  ,
+  c("y_factor", features_selected)
+]
+
+
+# ====================================================================
+# 6. DECISION TREE
+# ====================================================================
+
+cat("\n============================================\n")
+cat("DECISION TREE ANALYSIS\n")
+cat("============================================\n")
+
+
+# --------------------------------------------------------------------
+# Grid of tree parameters
+# --------------------------------------------------------------------
+
+cp_values <- c(
+  0.00001,
+  0.00005,
+  0.0001,
+  0.0005,
+  0.001,
+  0.005,
+  0.01,
+  0.05,
+  0.1
+)
+
+maxdepth_values <- c(
+  2,
+  3,
+  4,
+  5,
+  6,
+  8
+)
+
+minsplit_values <- c(
+  10,
+  20,
+  30,
+  50,
+  100
+)
+
+minbucket_values <- c(
+  5,
+  10,
+  20,
+  30,
+  50
+)
+
+
+# ====================================================================
+# 7. METRIC FUNCTIONS
+# ====================================================================
+
+# --------------------------------------------------------------------
+# Brier score
+# --------------------------------------------------------------------
+
+brier_score <- function(obs, pred) {
+  
+  mean(
+    (obs - pred)^2,
+    na.rm = TRUE
+  )
+  
+}
+
+
+# --------------------------------------------------------------------
+# Log loss
+# --------------------------------------------------------------------
+
+log_loss <- function(obs, pred) {
+  
+  eps <- 1e-15
+  
+  pred <- pmin(
+    pmax(pred, eps),
+    1 - eps
+  )
+  
+  -mean(
+    obs * log(pred) +
+      (1 - obs) * log(1 - pred),
+    na.rm = TRUE
+  )
+  
+}
+
+
+# ====================================================================
+# 8. INTERNAL CROSS-VALIDATION FOR PARAMETER SELECTION
+# ====================================================================
+#
+# IMPORTANT:
+#
+# The TEST set is NOT used here.
+#
+# We use 5-fold CV inside the TRAINING set to select
+# the tree parameters.
+# ====================================================================
+
+set.seed(123)
+
+folds <- sample(
+  rep(
+    1:5,
+    length.out = nrow(tree_train)
+  )
+)
+
+results_grid <- data.frame()
+
+
+cat("\nStarting 5-fold cross-validation...\n")
+
+
+for (cp_val in cp_values) {
+  
+  for (maxd in maxdepth_values) {
+    
+    for (mins in minsplit_values) {
+      
+      for (minb in minbucket_values) {
+        
+        # Skip impossible combinations
+        if (minb >= mins) {
+          next
+        }
+        
+        fold_auc <- c()
+        
+        for (k in 1:5) {
+          
+          train_cv <- tree_train[folds != k, ]
+          valid_cv <- tree_train[folds == k, ]
+          
+          # ----------------------------------------------------------
+          # Fit tree
+          # ----------------------------------------------------------
+          
+          model_cv <- tryCatch(
+            
+            rpart(
+              y_factor ~ .,
+              data = train_cv,
+              method = "class",
+              
+              control = rpart.control(
+                cp = cp_val,
+                maxdepth = maxd,
+                minsplit = mins,
+                minbucket = minb,
+                xval = 0
+              )
+            ),
+            
+            error = function(e) {
+              NULL
+            }
+            
+          )
+          
+          
+          if (is.null(model_cv)) {
+            next
+          }
+          
+          
+          # ----------------------------------------------------------
+          # Predict probabilities
+          # ----------------------------------------------------------
+          
+          pred_prob <- tryCatch(
+            
+            predict(
+              model_cv,
+              newdata = valid_cv,
+              type = "prob"
+            )[,"Case"],
+            
+            error = function(e) {
+              NULL
+            }
+            
+          )
+          
+          
+          if (is.null(pred_prob)) {
+            next
+          }
+          
+          
+          # ----------------------------------------------------------
+          # AUC
+          # ----------------------------------------------------------
+          
+          roc_cv <- tryCatch(
+            
+            roc(
+              response = valid_cv$y_factor,
+              predictor = pred_prob,
+              levels = c("Control", "Case"),
+              direction = "<",
+              quiet = TRUE
+            ),
+            
+            error = function(e) {
+              NULL
+            }
+            
+          )
+          
+          
+          if (!is.null(roc_cv)) {
+            
+            fold_auc <- c(
+              fold_auc,
+              as.numeric(auc(roc_cv))
+            )
+            
+          }
+          
+        }
+        
+        
+        # ------------------------------------------------------------
+        # Mean CV AUC
+        # ------------------------------------------------------------
+        
+        if (length(fold_auc) > 0) {
+          
+          mean_cv_auc <- mean(
+            fold_auc,
+            na.rm = TRUE
+          )
+          
+        } else {
+          
+          mean_cv_auc <- NA
+          
+        }
+        
+        
+        # ------------------------------------------------------------
+        # Store results
+        # ------------------------------------------------------------
+        
+        results_grid <- rbind(
+          
+          results_grid,
+          
+          data.frame(
+            cp = cp_val,
+            maxdepth = maxd,
+            minsplit = mins,
+            minbucket = minb,
+            CV_AUC = mean_cv_auc
+          )
+          
+        )
+        
+      }
+    }
+  }
+}
+
+
+# ====================================================================
+# 9. SELECT BEST PARAMETERS
+# ====================================================================
+
+results_grid <- results_grid[
+  !is.na(results_grid$CV_AUC),
+]
+
+if (nrow(results_grid) == 0) {
+  
+  stop(
+    "No valid decision tree model was obtained."
+  )
+  
+}
+
+
+results_grid <- results_grid[
+  order(-results_grid$CV_AUC),
+]
+
+
+best_params <- results_grid[1, ]
+
+
+cat("\n============================================\n")
+cat("BEST TREE PARAMETERS\n")
+cat("============================================\n")
+
+print(best_params)
+
+
+# ====================================================================
+# 10. FIT FINAL TREE ON ALL TRAINING DATA
+# ====================================================================
+
+best_model <- rpart(
+  
+  y_factor ~ .,
+  
+  data = tree_train,
+  
+  method = "class",
+  
+  control = rpart.control(
+    
+    cp = best_params$cp,
+    maxdepth = best_params$maxdepth,
+    minsplit = best_params$minsplit,
+    minbucket = best_params$minbucket,
+    
+    xval = 10
+    
+  )
+  
+)
+
+
+cat("\nFinal decision tree fitted successfully.\n")
+
+
+# ====================================================================
+# 11. PREDICT TRAINING AND TESTING DATA
+# ====================================================================
+
+# Probability of CASE (y = 1)
+
+p_train <- predict(
+  best_model,
+  newdata = tree_train,
+  type = "prob"
+)[,"Case"]
+
+
+p_test <- predict(
+  best_model,
+  newdata = tree_test,
+  type = "prob"
+)[,"Case"]
+
+
+# Class prediction
+
+class_train <- predict(
+  best_model,
+  newdata = tree_train,
+  type = "class"
+)
+
+class_test <- predict(
+  best_model,
+  newdata = tree_test,
+  type = "class"
+)
+
+
+# ====================================================================
+# 12. AUC-ROC
+# ====================================================================
+
+roc_train <- roc(
+  response = tree_train$y_factor,
+  predictor = p_train,
+  levels = c("Control", "Case"),
+  direction = "<",
+  quiet = TRUE
+)
+
+roc_test <- roc(
+  response = tree_test$y_factor,
+  predictor = p_test,
+  levels = c("Control", "Case"),
+  direction = "<",
+  quiet = TRUE
+)
+
+
+auc_train <- as.numeric(
+  auc(roc_train)
+)
+
+auc_test <- as.numeric(
+  auc(roc_test)
+)
+
+
+# ====================================================================
+# 13. BRIER SCORE
+# ====================================================================
+
+brier_train <- brier_score(
+  df_train_fs$y,
+  p_train
+)
+
+brier_test <- brier_score(
+  df_test_fs$y,
+  p_test
+)
+
+
+# ====================================================================
+# 14. LOG LOSS
+# ====================================================================
+
+logloss_train <- log_loss(
+  df_train_fs$y,
+  p_train
+)
+
+logloss_test <- log_loss(
+  df_test_fs$y,
+  p_test
+)
+
+
+# ====================================================================
+# 15. CLASSIFICATION ACCURACY
+# ====================================================================
+#
+# This is NOT one of your three requested metrics, but is useful
+# for describing how the tree classifies samples.
+# ====================================================================
+
+pred_train_binary <- ifelse(
+  class_train == "Case",
+  1,
+  0
+)
+
+pred_test_binary <- ifelse(
+  class_test == "Case",
+  1,
+  0
+)
+
+
+accuracy_train <- mean(
+  pred_train_binary == df_train_fs$y
+)
+
+accuracy_test <- mean(
+  pred_test_binary == df_test_fs$y
+)
+
+
+# ====================================================================
+# 16. CONFUSION MATRICES
+# ====================================================================
+
+confusion_train <- table(
+  Actual = df_train_fs$y,
+  Predicted = pred_train_binary
+)
+
+confusion_test <- table(
+  Actual = df_test_fs$y,
+  Predicted = pred_test_binary
+)
+
+
+# ====================================================================
+# 17. FINAL PERFORMANCE
+# ====================================================================
+
+performance <- data.frame(
+  
+  Dataset = c(
+    "Training",
+    "Testing"
+  ),
+  
+  AUC_ROC = c(
+    auc_train,
+    auc_test
+  ),
+  
+  Brier_Score = c(
+    brier_train,
+    brier_test
+  ),
+  
+  Log_Loss = c(
+    logloss_train,
+    logloss_test
+  ),
+  
+  Accuracy = c(
+    accuracy_train,
+    accuracy_test
+  )
+  
+)
+
+
+cat("\n============================================\n")
+cat("DECISION TREE PERFORMANCE\n")
+cat("============================================\n")
+
+print(
+  performance,
+  row.names = FALSE
+)
+
+
+# ====================================================================
+# 18. CONFUSION MATRICES
+# ====================================================================
+
+cat("\n============================================\n")
+cat("TRAINING CONFUSION MATRIX\n")
+cat("============================================\n")
+
+print(confusion_train)
+
+
+cat("\n============================================\n")
+cat("TESTING CONFUSION MATRIX\n")
+cat("============================================\n")
+
+print(confusion_test)
+
+
+# ====================================================================
+# 19. DISPLAY TREE
+# ====================================================================
+
+cat("\n============================================\n")
+cat("DECISION TREE\n")
+cat("============================================\n")
+
+print(best_model)
+
+
+# Plot tree
+
+png(
+  "decision_tree_plot.png",
+  width = 2400,
+  height = 1800,
+  res = 250
+)
+
+rpart.plot(
+  best_model,
+  
+  type = 4,
+  extra = 104,
+  
+  fallen.leaves = TRUE,
+  
+  box.palette = "GnBu",
+  
+  shadow.col = "gray",
+  
+  nn = TRUE,
+  
+  main = "Decision Tree - Binary Phenotype"
+)
+
+dev.off()
+
+
+# ====================================================================
+# 20. EXTRACT TREE RULES
+# ====================================================================
+
+cat("\n============================================\n")
+cat("DECISION TREE RULES\n")
+cat("============================================\n")
+
+tree_rules <- rpart.rules(
+  best_model
+)
+
+print(tree_rules)
+
+
+# Save rules
+
+writeLines(
+  capture.output(
+    rpart.rules(best_model)
+  ),
+  "decision_tree_rules.txt"
+)
+
+
+# ====================================================================
+# 21. SAVE FULL TREE SUMMARY
+# ====================================================================
+
+sink(
+  "decision_tree_full_summary.txt"
+)
+
+cat("============================================\n")
+cat("DECISION TREE - FULL SUMMARY\n")
+cat("============================================\n\n")
+
+
+cat("Number of selected SNPs:\n")
+cat(length(features_selected), "\n\n")
+
+
+cat("Selected SNPs:\n")
+cat(paste(features_selected, collapse = "\n"))
+cat("\n\n")
+
+
+cat("Best parameters:\n")
+print(best_params)
+
+
+cat("\n\nTree:\n")
+print(best_model)
+
+
+cat("\n\nTree rules:\n")
+print(
+  rpart.rules(best_model)
+)
+
+
+cat("\n\nVariable importance:\n")
+
+if (!is.null(best_model$variable.importance)) {
+  
+  importance_df <- data.frame(
+    
+    Variable =
+      names(best_model$variable.importance),
+    
+    Importance =
+      as.numeric(best_model$variable.importance)
+    
+  )
+  
+  importance_df <-
+    importance_df[
+      order(
+        -importance_df$Importance
+      ),
+    ]
+  
+  print(
+    importance_df,
+    row.names = FALSE
+  )
+  
+} else {
+  
+  cat(
+    "No variable importance available.\n"
+  )
+  
+}
+
+
+sink()
+
+
+# ====================================================================
+# 22. VARIABLE IMPORTANCE
+# ====================================================================
+
+if (!is.null(best_model$variable.importance)) {
+  
+  importance_df <- data.frame(
+    
+    Variable =
+      names(best_model$variable.importance),
+    
+    Importance =
+      as.numeric(best_model$variable.importance)
+    
+  )
+  
+  importance_df <-
+    importance_df[
+      order(
+        -importance_df$Importance
+      ),
+    ]
+  
+  write.csv(
+    importance_df,
+    "decision_tree_variable_importance.csv",
+    row.names = FALSE
+  )
+  
+}
+
+
+# ====================================================================
+# 23. SAVE PERFORMANCE METRICS
+# ====================================================================
+
+write.csv(
+  performance,
+  "decision_tree_metrics.csv",
+  row.names = FALSE
+)
+
+
+write.table(
+  performance,
+  "decision_tree_metrics.txt",
+  sep = "\t",
+  row.names = FALSE,
+  quote = FALSE
+)
+
+
+# ====================================================================
+# 24. SAVE GRID SEARCH RESULTS
+# ====================================================================
+
+write.csv(
+  results_grid,
+  "decision_tree_CV_grid_search.csv",
+  row.names = FALSE
+)
+
+
+# ====================================================================
+# 25. SAVE PREDICTIONS
+# ====================================================================
+
+predictions_train <- data.frame(
+  
+  Actual = df_train_fs$y,
+  
+  Predicted_Class =
+    pred_train_binary,
+  
+  Predicted_Probability =
+    p_train,
+  
+  Set = "Training"
+  
+)
+
+
+predictions_test <- data.frame(
+  
+  Actual = df_test_fs$y,
+  
+  Predicted_Class =
+    pred_test_binary,
+  
+  Predicted_Probability =
+    p_test,
+  
+  Set = "Testing"
+  
+)
+
+
+predictions_all <- rbind(
+  predictions_train,
+  predictions_test
+)
+
+
+write.csv(
+  predictions_all,
+  "decision_tree_predictions.csv",
+  row.names = FALSE
+)
+
+
+# ====================================================================
+# 26. SAVE MODEL
+# ====================================================================
+
+saveRDS(
+  best_model,
+  "best_decision_tree_model.rds"
+)
+
+
+# ====================================================================
+# 27. PRINT FINAL SUMMARY
+# ====================================================================
+
+cat("\n============================================\n")
+cat("FINAL SUMMARY\n")
+cat("============================================\n")
+
+cat(
+  "\nNumber of selected SNPs:",
+  length(features_selected),
+  "\n"
+)
+
+cat(
+  "\nBest CV AUC:",
+  round(best_params$CV_AUC, 6),
+  "\n"
+)
+
+cat(
+  "\nFinal tree parameters:\n"
+)
+
+cat(
+  "  cp = ",
+  best_params$cp,
+  "\n",
+  sep = ""
+)
+
+cat(
+  "  maxdepth = ",
+  best_params$maxdepth,
+  "\n",
+  sep = ""
+)
+
+cat(
+  "  minsplit = ",
+  best_params$minsplit,
+  "\n",
+  sep = ""
+)
+
+cat(
+  "  minbucket = ",
+  best_params$minbucket,
+  "\n",
+  sep = ""
+)
+
+
+cat("\nPerformance:\n")
+print(
+  performance,
+  row.names = FALSE
+)
+
+
+cat("\n\nTree rules:\n")
+print(
+  rpart.rules(best_model)
+)
+
+
+cat("\n============================================\n")
+cat("FILES SAVED\n")
+cat("============================================\n")
+
+cat("1. decision_tree_metrics.csv\n")
+cat("2. decision_tree_metrics.txt\n")
+cat("3. decision_tree_rules.txt\n")
+cat("4. decision_tree_full_summary.txt\n")
+cat("5. decision_tree_variable_importance.csv\n")
+cat("6. decision_tree_CV_grid_search.csv\n")
+cat("7. decision_tree_predictions.csv\n")
+cat("8. decision_tree_plot.png\n")
+cat("9. best_decision_tree_model.rds\n")
+
+
+cat("\nDecision tree analysis completed successfully.\n")
