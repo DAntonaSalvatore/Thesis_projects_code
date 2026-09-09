@@ -2890,6 +2890,323 @@ stopCluster(cl)
 
 registerDoSEQ()
 
+##
+## PARTE RELATIVA ALLA SYMBOLIC REGRESSION
+##
+set.seed(123)
+library(gramEvol)
+library(data.table)
+library(foreach)
+library(doParallel)
+library(parallel)
+
+# ------------------------------------------------------------
+# Set up parallel processing
+# ------------------------------------------------------------
+# Detect number of cores
+num_cores <- detectCores()
+
+# Register parallel backend
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+setwd(getwd())
+ID_train_test <- read.delim("train_test_split.txt")
+input <- fread("A_thaliana_TF10_NO_NA.txt")
+feature_selected <- read.delim("selected_snps.txt")
+input <- as.data.frame(input)
+
+
+# rebuild the original training and testing set
+keep_cols <- c("IID", "FT10", feature_selected$SNP)
+input_selected <- input[, colnames(input) %in% keep_cols, drop = FALSE]
+
+training_list <- ID_train_test[ID_train_test$set == "train",]
+testing_list <- ID_train_test[ID_train_test$set == "test",]
+training_list <- training_list[,-2]
+testing_list <- testing_list[,-2]
+
+train_df <- input_selected[input_selected$IID %in% training_list, ]
+test_df  <- input_selected[input_selected$IID %in% testing_list, ]
+
+y_train <- train_df$FT10
+X_train <- train_df[, !(names(train_df) %in% c("IID", "FT10"))]
+
+y_test <- test_df$FT10
+X_test <- test_df[, !(names(test_df) %in% c("IID", "FT10"))]
+X_train_scaled <- scale(X_train)
+X_test_scaled  <- scale(X_test,
+                        center = attr(X_train_scaled, "scaled:center"),
+                        scale  = attr(X_train_scaled, "scaled:scale"))
+
+lm_data  <- cbind(phenotype = y_train, X_train_scaled)
+test_data <- cbind(phenotype = y_test, X_test_scaled)
+
+# Extract SNP names for grammar
+snp_names <- colnames(X_train)
+
+# ------------------------------------------------------------
+# 1. Prepare data for symbolic regression
+# ------------------------------------------------------------
+marker_names <- snp_names
+
+# Create training data with phenotype column (rename FT10 to phenotype)
+lm_data <- data.frame(phenotype = y_train, X_train_scaled, check.names = FALSE)
+
+# Create test data with phenotype column
+test_data <- data.frame(phenotype = y_test, X_test_scaled, check.names = FALSE)
+
+# ------------------------------------------------------------
+# 2. Define safe mathematical functions
+# ------------------------------------------------------------
+safe_log <- function(x) ifelse(x <= 0, 0, log(x))
+safe_sqrt <- function(x) ifelse(x < 0, 0, sqrt(x))
+safe_div <- function(x, y) ifelse(y == 0, 0, x / y)
+
+# ------------------------------------------------------------
+# 3. Define grammar
+# ------------------------------------------------------------
+ruleDef <- list(
+  expr = gsrule("<expr><op><expr>", "<func>(<expr>)", "<var>", "<const>"),
+  op = gsrule("+", "-", "*"),
+  func = grule(safe_log, exp, safe_sqrt),
+  var = do.call(grule, as.list(marker_names)),  # dynamically include all markers
+  const = grule(1, 2, 3)
+)
+
+grammarDef <- CreateGrammar(ruleDef)
+
+# ------------------------------------------------------------
+# 4. Define evaluation function with regularization and quote cleaning
+# ------------------------------------------------------------
+evalFunc <- function(expr) {
+  tryCatch({
+    # Clean expression from quotes
+    expr_clean <- gsub('[\"\'`]', '', expr)
+    
+    # Evaluate expression
+    e <- parse(text = expr_clean)
+    y_pred <- eval(e, envir = lm_data)
+    y <- lm_data$phenotype
+    
+    # Validate predictions
+    if (length(y_pred) != length(y) ||
+        !is.numeric(y_pred) ||
+        any(is.na(y_pred)) ||
+        any(is.infinite(y_pred))) {
+      return(1e10)
+    }
+    
+    # RMSE
+    rmse <- sqrt(mean((y - y_pred)^2))
+    
+    # Complexity penalty
+    n_terms <- length(strsplit(expr_clean, split = "\\+|-|\\*")[[1]])
+    n_ops <- length(gregexpr("\\+|-|\\*", expr_clean)[[1]])
+    if (n_ops < 0) n_ops <- 0
+    
+    lambda <- 0.01  # regularization strength
+    cost <- rmse + lambda * (n_terms + n_ops)
+    
+    return(cost)
+    
+  }, error = function(e) {
+    return(1e10)
+  })
+}
+
+# ------------------------------------------------------------
+# 5. Define metrics computation function
+# ------------------------------------------------------------
+compute_metrics <- function(expr, data) {
+  tryCatch({
+    y <- data$phenotype
+    
+    # Clean expression from quotes
+    expr_clean <- gsub('[\"\'`]', '', expr)
+    
+    e <- parse(text = expr_clean)
+    y_pred <- eval(e, envir = data)
+    
+    if (length(y_pred) != length(y) || 
+        !is.numeric(y_pred) || 
+        any(is.na(y_pred)) ||
+        any(is.infinite(y_pred))) {
+      return(list(
+        RMSE = NA,
+        MAE = NA,
+        R_squared = NA,
+        Pearson_r_squared = NA
+      ))
+    }
+    
+    rmse <- sqrt(mean((y - y_pred)^2))
+    mae <- mean(abs(y - y_pred))
+    ss_res <- sum((y - y_pred)^2)
+    ss_tot <- sum((y - mean(y))^2)
+    r_squared <- ifelse(ss_tot == 0, 0, 1 - (ss_res / ss_tot))
+    pearson_r <- cor(y, y_pred, use = "complete.obs")
+    pearson_r_squared <- ifelse(is.na(pearson_r), 0, pearson_r^2)
+    
+    list(
+      RMSE = rmse,
+      MAE = mae,
+      R_squared = r_squared,
+      Pearson_r_squared = pearson_r_squared
+    )
+  }, error = function(e) {
+    return(list(
+      RMSE = NA,
+      MAE = NA,
+      R_squared = NA,
+      Pearson_r_squared = NA
+    ))
+  })
+}
+
+# ------------------------------------------------------------
+# 6. Run parallel symbolic regression
+# ------------------------------------------------------------
+cat("Starting parallel symbolic regression with", num_cores, "cores...\n")
+
+# Number of runs
+n_runs <- 1000
+
+# Run parallel symbolic regression
+results_list <- foreach(i = 1:n_runs, 
+                        .packages = c("gramEvol", "data.table"),
+                        .combine = rbind,
+                        .errorhandling = "remove") %dopar% {
+                          cat("Starting run", i, "of", n_runs, "\n")
+                          set.seed(i)
+                          
+                          # Run grammatical evolution
+                          ge <- GrammaticalEvolution(
+                            grammarDef,
+                            evalFunc,
+                            iterations = 1000,
+                            popSize = 300,
+                            newPerGen = 15,
+                            elitism = 3,
+                            mutationChance = 0.3,
+                            optimizer = "ga",
+                            verbose = FALSE
+                          )
+                          
+                          # Extract best expression
+                          best_expr <- as.character(ge$best$expressions)
+                          best_expr <- gsub('[\"\'`]', '', best_expr)  # Clean quotes
+                          
+                          # Compute metrics on training set
+                          train_metrics <- compute_metrics(best_expr, lm_data)
+                          
+                          # Compute metrics on test set
+                          test_metrics <- compute_metrics(best_expr, test_data)
+                          
+                          # Return results as a data frame row
+                          data.frame(
+                            Seed = paste0("Seed N:", i),
+                            Train_R_squared = train_metrics$R_squared,
+                            Train_Pearson_r_squared = train_metrics$Pearson_r_squared,
+                            Train_RMSE = train_metrics$RMSE,
+                            Train_MAE = train_metrics$MAE,
+                            Test_R_squared = test_metrics$R_squared,
+                            Test_Pearson_r_squared = test_metrics$Pearson_r_squared,
+                            Test_RMSE = test_metrics$RMSE,
+                            Test_MAE = test_metrics$MAE,
+                            Best_expression = best_expr,
+                            stringsAsFactors = FALSE
+                          )
+                        }
+
+# Stop the parallel cluster
+stopCluster(cl)
+
+# ------------------------------------------------------------
+# 7. Process and summarize results
+# ------------------------------------------------------------
+# Convert to data frame if not already
+if (is.list(results_list) && !is.data.frame(results_list)) {
+  results_table <- do.call(rbind, results_list)
+} else {
+  results_table <- results_list
+}
+
+# Find best overall expression based on test R-squared
+valid_results <- results_table[!is.na(results_table$Test_R_squared), ]
+if (nrow(valid_results) > 0) {
+  best_idx <- which.max(valid_results$Test_R_squared)
+  best_overall_expr <- valid_results$Best_expression[best_idx]
+  best_train_metrics <- list(
+    R_squared = valid_results$Train_R_squared[best_idx],
+    Pearson_r_squared = valid_results$Train_Pearson_r_squared[best_idx],
+    RMSE = valid_results$Train_RMSE[best_idx],
+    MAE = valid_results$Train_MAE[best_idx]
+  )
+  best_test_metrics <- list(
+    R_squared = valid_results$Test_R_squared[best_idx],
+    Pearson_r_squared = valid_results$Test_Pearson_r_squared[best_idx],
+    RMSE = valid_results$Test_RMSE[best_idx],
+    MAE = valid_results$Test_MAE[best_idx]
+  )
+} else {
+  best_overall_expr <- "No valid expressions found"
+  best_train_metrics <- list(R_squared = NA, Pearson_r_squared = NA, RMSE = NA, MAE = NA)
+  best_test_metrics <- list(R_squared = NA, Pearson_r_squared = NA, RMSE = NA, MAE = NA)
+}
+
+# ------------------------------------------------------------
+# 8. Print summary statistics
+# ------------------------------------------------------------
+cat("\n=== BEST OVERALL EXPRESSION ===\n")
+cat("Expression:", best_overall_expr, "\n\n")
+cat("=== TRAINING SET METRICS (Best Expression) ===\n")
+cat("R-squared:", round(best_train_metrics$R_squared, 4), "\n")
+cat("Pearson r-squared:", round(best_train_metrics$Pearson_r_squared, 4), "\n")
+cat("MAE:", round(best_train_metrics$MAE, 4), "\n\n")
+
+
+
+cat("=== TEST SET METRICS (Best Expression) ===\n")
+cat("R-squared:", round(best_test_metrics$R_squared, 4), "\n")
+cat("Pearson r-squared:", round(best_test_metrics$Pearson_r_squared, 4), "\n")
+cat("RMSE:", round(best_test_metrics$RMSE, 4), "\n")
+cat("MAE:", round(best_test_metrics$MAE, 4), "\n\n")
+
+
+
+# ------------------------------------------------------------
+# 9. Save full results to file
+# ------------------------------------------------------------
+# Convert expressions to character before saving
+results_table$Best_expression <- as.character(results_table$Best_expression)
+
+# Save detailed results
+write.table(results_table, 
+            file = "symbolic_regression_parallel_results.txt", 
+            row.names = FALSE, 
+            quote = FALSE, 
+            sep = "\t")
+
+# Save summary of best expression
+best_summary <- data.frame(
+  Metric = c("Best_Expression", 
+             "Train_R_squared", "Train_Pearson_r_squared", "Train_RMSE", "Train_MAE",
+             "Test_R_squared", "Test_Pearson_r_squared", "Test_RMSE", "Test_MAE"),
+  Value = c(best_overall_expr,
+            best_train_metrics$R_squared, best_train_metrics$Pearson_r_squared,
+            best_train_metrics$RMSE, best_train_metrics$MAE,
+            best_test_metrics$R_squared, best_test_metrics$Pearson_r_squared,
+            best_test_metrics$RMSE, best_test_metrics$MAE)
+)
+
+write.table(best_summary, 
+            file = "best_symbolic_model_summary.txt", 
+            row.names = FALSE, 
+            quote = FALSE, 
+            sep = "\t")
+
+cat("\nResults saved to:\n")
 
 
 # FINE PARTE FENOTIPO CONTINUO
