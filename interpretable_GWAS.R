@@ -4666,3 +4666,3262 @@ cat("9. best_decision_tree_model.rds\n")
 
 
 cat("\nDecision tree analysis completed successfully.\n")
+
+##
+## PARTE RELATIVA A SVM BINARIO 
+##
+
+
+set.seed(123)
+
+
+############################################################
+# 2. LIBRARIES
+############################################################
+
+library(data.table)
+library(foreach)
+library(doParallel)
+library(parallel)
+library(caret)
+library(kernlab)
+library(pROC)
+
+
+############################################################
+# 3. PARALLEL COMPUTING
+############################################################
+
+num_cores <- detectCores() - 1
+
+if (is.na(num_cores) || num_cores < 1) {
+  num_cores <- 1
+}
+
+cat("\nNumber of CPU cores:", num_cores, "\n")
+
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+
+setwd(
+  "C:\\Users\\Salvatore\\Desktop\\Dottorato\\richiesta_dati_reali\\EGAD00000000003_decriptati\\effettivamente_utili"
+)
+
+
+############################################################
+# 5. INPUT FILES
+############################################################
+
+selected_file <- "selected_SNPs.txt"
+
+train_file <- "train_selected_SNPs.csv"
+
+test_file <- "test_selected_SNPs.csv"
+
+
+############################################################
+# 6. LOAD SELECTED SNP LIST
+############################################################
+
+feature_selected <- fread(
+  selected_file,
+  data.table = FALSE,
+  header = FALSE
+)
+
+
+############################################################
+# 7. CHECK SELECTED SNP COLUMN
+############################################################
+
+if (!"V1" %in% colnames(feature_selected)) {
+  
+  stop(
+    "The file selected_SNPs.txt must contain a column called 'V1'."
+  )
+  
+}
+
+
+selected_snps <- as.character(
+  feature_selected$V1
+)
+
+
+selected_snps <- selected_snps[
+  !is.na(selected_snps) &
+    selected_snps != ""
+]
+
+
+selected_snps <- unique(
+  selected_snps
+)
+
+
+cat(
+  "\nNumber of selected SNPs:",
+  length(selected_snps),
+  "\n"
+)
+
+
+############################################################
+# 8. LOAD TRAINING AND TESTING DATA
+############################################################
+
+train_df <- fread(
+  train_file,
+  data.table = FALSE
+)
+
+test_df <- fread(
+  test_file,
+  data.table = FALSE
+)
+
+names(train_df) <- gsub(
+  '"',
+  '',
+  names(train_df)
+)
+
+names(test_df) <- gsub(
+  '"',
+  '',
+  names(test_df)
+)
+
+
+############################################################
+# 9. CHECK PHENOTYPE COLUMN
+############################################################
+
+if (!"phenotype" %in% colnames(train_df)) {
+  
+  stop(
+    "Column 'phenotype' not found in training dataset."
+  )
+  
+}
+
+
+if (!"phenotype" %in% colnames(test_df)) {
+  
+  stop(
+    "Column 'phenotype' not found in testing dataset."
+  )
+  
+}
+
+
+############################################################
+# 10. CHECK SELECTED SNPs
+############################################################
+
+missing_train <- setdiff(
+  selected_snps,
+  colnames(train_df)
+)
+
+missing_test <- setdiff(
+  selected_snps,
+  colnames(test_df)
+)
+
+
+if (length(missing_train) > 0) {
+  
+  cat(
+    "\nThe following SNPs are missing from the training dataset:\n"
+  )
+  
+  print(
+    missing_train
+  )
+  
+  stop(
+    "Some selected SNPs are missing from train_selected_SNPs.csv."
+  )
+  
+}
+
+
+if (length(missing_test) > 0) {
+  
+  cat(
+    "\nThe following SNPs are missing from the testing dataset:\n"
+  )
+  
+  print(
+    missing_test
+  )
+  
+  stop(
+    "Some selected SNPs are missing from test_selected_SNPs.csv."
+  )
+  
+}
+
+
+############################################################
+# 11. SELECT PHENOTYPE + SNPs
+############################################################
+
+train_data <- train_df[
+  ,
+  c(
+    "phenotype",
+    selected_snps
+  ),
+  drop = FALSE
+]
+
+test_data <- test_df[
+  ,
+  c(
+    "phenotype",
+    selected_snps
+  ),
+  drop = FALSE
+]
+
+
+############################################################
+# 12. CONVERT SNPs TO NUMERIC
+############################################################
+
+convert_snp <- function(x) {
+  
+  if (is.factor(x)) {
+    
+    return(
+      as.numeric(
+        as.character(x)
+      )
+    )
+    
+  }
+  
+  return(
+    as.numeric(x)
+  )
+  
+}
+
+
+train_data[selected_snps] <- lapply(
+  train_data[selected_snps],
+  convert_snp
+)
+
+test_data[selected_snps] <- lapply(
+  test_data[selected_snps],
+  convert_snp
+)
+
+
+############################################################
+# 13. CHECK FOR NA VALUES IN SNPs
+############################################################
+
+if (
+  anyNA(
+    train_data[
+      ,
+      selected_snps,
+      drop = FALSE
+    ]
+  )
+) {
+  
+  cat(
+    "\nNA values detected in training SNPs.\n"
+  )
+  
+  print(
+    colSums(
+      is.na(
+        train_data[
+          ,
+          selected_snps,
+          drop = FALSE
+        ]
+      )
+    )
+  )
+  
+  stop(
+    "Training SNP matrix contains NA values."
+  )
+  
+}
+
+
+if (
+  anyNA(
+    test_data[
+      ,
+      selected_snps,
+      drop = FALSE
+    ]
+  )
+) {
+  
+  cat(
+    "\nNA values detected in testing SNPs.\n"
+  )
+  
+  print(
+    colSums(
+      is.na(
+        test_data[
+          ,
+          selected_snps,
+          drop = FALSE
+        ]
+      )
+    )
+  )
+  
+  stop(
+    "Testing SNP matrix contains NA values."
+  )
+  
+}
+
+
+############################################################
+# 14. CHECK PHENOTYPE
+############################################################
+
+if (anyNA(train_data$phenotype)) {
+  
+  stop(
+    "NA values detected in training phenotype."
+  )
+  
+}
+
+
+if (anyNA(test_data$phenotype)) {
+  
+  stop(
+    "NA values detected in testing phenotype."
+  )
+  
+}
+
+
+############################################################
+# 15. CHECK BINARY PHENOTYPE
+############################################################
+
+train_unique <- sort(
+  unique(
+    train_data$phenotype
+  )
+)
+
+test_unique <- sort(
+  unique(
+    test_data$phenotype
+  )
+)
+
+
+cat(
+  "\nTraining phenotype values:\n"
+)
+
+print(
+  train_unique
+)
+
+
+cat(
+  "\nTesting phenotype values:\n"
+)
+
+print(
+  test_unique
+)
+
+
+if (length(train_unique) != 2) {
+  
+  stop(
+    "Training phenotype must contain exactly two classes."
+  )
+  
+}
+
+
+if (length(test_unique) != 2) {
+  
+  stop(
+    "Testing phenotype must contain exactly two classes."
+  )
+  
+}
+
+
+############################################################
+# 16. FORCE PHENOTYPE TO BINARY FACTOR
+#
+# Assumes the phenotype is coded 0/1.
+# Class1 = phenotype 1
+# Class0 = phenotype 0
+############################################################
+
+if (
+  !all(
+    train_unique %in% c(
+      0,
+      1
+    )
+  )
+) {
+  
+  stop(
+    "The phenotype must be coded as 0 and 1."
+  )
+  
+}
+
+
+if (
+  !all(
+    test_unique %in% c(
+      0,
+      1
+    )
+  )
+) {
+  
+  stop(
+    "The phenotype must be coded as 0 and 1."
+  )
+  
+}
+
+
+train_data$phenotype <- factor(
+  ifelse(
+    train_data$phenotype == 1,
+    "Class1",
+    "Class0"
+  ),
+  levels = c(
+    "Class1",
+    "Class0"
+  )
+)
+
+
+test_data$phenotype <- factor(
+  ifelse(
+    test_data$phenotype == 1,
+    "Class1",
+    "Class0"
+  ),
+  levels = c(
+    "Class1",
+    "Class0"
+  )
+)
+
+
+############################################################
+# 17. CHECK CLASS DISTRIBUTION
+############################################################
+
+cat(
+  "\nTraining class distribution:\n"
+)
+
+print(
+  table(
+    train_data$phenotype
+  )
+)
+
+
+cat(
+  "\nTesting class distribution:\n"
+)
+
+print(
+  table(
+    test_data$phenotype
+  )
+)
+
+
+############################################################
+# 18. SAMPLE NUMBERS
+############################################################
+
+cat(
+  "\nTraining samples:",
+  nrow(train_data),
+  "\n"
+)
+
+cat(
+  "Testing samples :",
+  nrow(test_data),
+  "\n"
+)
+
+cat(
+  "Number of SNPs  :",
+  length(selected_snps),
+  "\n"
+)
+
+
+############################################################
+# 19. CROSS-VALIDATION SETTINGS
+############################################################
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final",
+  allowParallel = TRUE
+)
+
+
+############################################################
+# 20. SVM HYPERPARAMETER GRID
+############################################################
+
+svm_grid <- expand.grid(
+  cost = c(
+    0.001,
+    0.01,
+    0.1,
+    1
+  )
+)
+
+
+############################################################
+# 21. TRAIN LINEAR SVM
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "TRAINING BINARY LINEAR SVM\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+svm_model <- train(
+  phenotype ~ .,
+  data = train_data,
+  method = "svmLinear2",
+  trControl = ctrl,
+  tuneGrid = svm_grid,
+  metric = "ROC",
+  preProcess = c(
+    "center",
+    "scale"
+  )
+)
+
+
+############################################################
+# 22. DISPLAY BEST MODEL
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "BEST MODEL\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+print(
+  svm_model$bestTune
+)
+
+
+############################################################
+# 23. EXTRACT FINAL e1071 MODEL
+############################################################
+
+final_model <- svm_model$finalModel
+
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "FINAL MODEL CLASS\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+print(
+  class(final_model)
+)
+
+
+############################################################
+# 24. DISPLAY MODEL STRUCTURE
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "FINAL MODEL STRUCTURE\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+print(
+  names(final_model)
+)
+
+
+############################################################
+# 25. EXTRACT PREPROCESSING PARAMETERS
+############################################################
+
+preprocess_mean <- svm_model$preProcess$mean
+
+preprocess_sd <- svm_model$preProcess$std
+
+
+############################################################
+# 26. CHECK PREPROCESSING PARAMETERS
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "CENTERING VALUES\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+print(
+  preprocess_mean
+)
+
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "SCALING VALUES\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+print(
+  preprocess_sd
+)
+
+
+############################################################
+# 27. CHECK PREPROCESSING PARAMETERS
+############################################################
+
+if (
+  !identical(
+    names(preprocess_mean),
+    names(preprocess_sd)
+  )
+) {
+  
+  stop(
+    "The names/order of preprocessing means and SDs do not match."
+  )
+  
+}
+
+
+############################################################
+# 28. REORDER PARAMETERS
+############################################################
+
+preprocess_mean <- preprocess_mean[
+  selected_snps
+]
+
+preprocess_sd <- preprocess_sd[
+  selected_snps
+]
+
+
+############################################################
+# 29. CHECK ZERO SD
+############################################################
+
+if (
+  any(
+    preprocess_sd == 0
+  )
+) {
+  
+  cat(
+    "\nVariables with zero standard deviation:\n"
+  )
+  
+  print(
+    names(preprocess_sd)[
+      preprocess_sd == 0
+    ]
+  )
+  
+  stop(
+    "At least one SNP has zero variance."
+  )
+  
+}
+
+
+############################################################
+# 30. PREDICT TRAINING PROBABILITIES
+############################################################
+
+pred_train_prob <- predict(
+  svm_model,
+  newdata = train_data,
+  type = "prob"
+)
+
+
+############################################################
+# 31. PREDICT TESTING PROBABILITIES
+############################################################
+
+pred_test_prob <- predict(
+  svm_model,
+  newdata = test_data,
+  type = "prob"
+)
+
+
+############################################################
+# 32. EXTRACT PROBABILITY OF POSITIVE CLASS
+############################################################
+
+prob_train <- as.numeric(
+  pred_train_prob$Class1
+)
+
+prob_test <- as.numeric(
+  pred_test_prob$Class1
+)
+
+
+############################################################
+# 33. CLASS PREDICTIONS
+############################################################
+
+pred_train_class <- predict(
+  svm_model,
+  newdata = train_data,
+  type = "raw"
+)
+
+pred_test_class <- predict(
+  svm_model,
+  newdata = test_data,
+  type = "raw"
+)
+
+
+############################################################
+# 34. ORIGINAL PHENOTYPE AS 0/1
+############################################################
+
+y_train <- ifelse(
+  train_data$phenotype == "Class1",
+  1,
+  0
+)
+
+y_test <- ifelse(
+  test_data$phenotype == "Class1",
+  1,
+  0
+)
+
+
+############################################################
+# 35. SAFE PROBABILITIES
+############################################################
+
+eps <- 1e-15
+
+
+prob_train_safe <- pmin(
+  pmax(
+    prob_train,
+    eps
+  ),
+  1 - eps
+)
+
+
+prob_test_safe <- pmin(
+  pmax(
+    prob_test,
+    eps
+  ),
+  1 - eps
+)
+
+
+############################################################
+# 36. AUC ROC
+############################################################
+
+train_roc <- roc(
+  response = y_train,
+  predictor = prob_train,
+  levels = c(
+    0,
+    1
+  ),
+  direction = "<",
+  quiet = TRUE
+)
+
+
+test_roc <- roc(
+  response = y_test,
+  predictor = prob_test,
+  levels = c(
+    0,
+    1
+  ),
+  direction = "<",
+  quiet = TRUE
+)
+
+
+train_AUC_ROC <- as.numeric(
+  auc(
+    train_roc
+  )
+)
+
+test_AUC_ROC <- as.numeric(
+  auc(
+    test_roc
+  )
+)
+
+
+############################################################
+# 37. BRIER SCORE
+############################################################
+
+train_Brier_Score <- mean(
+  (
+    prob_train -
+      y_train
+  )^2
+)
+
+
+test_Brier_Score <- mean(
+  (
+    prob_test -
+      y_test
+  )^2
+)
+
+
+############################################################
+# 38. LOG LOSS
+############################################################
+
+train_Log_Loss <- -mean(
+  y_train *
+    log(
+      prob_train_safe
+    ) +
+    (
+      1 - y_train
+    ) *
+    log(
+      1 - prob_train_safe
+    )
+)
+
+
+test_Log_Loss <- -mean(
+  y_test *
+    log(
+      prob_test_safe
+    ) +
+    (
+      1 - y_test
+    ) *
+    log(
+      1 - prob_test_safe
+    )
+)
+
+
+############################################################
+# 39. CLASSIFICATION ACCURACY
+############################################################
+
+train_accuracy <- mean(
+  pred_train_class ==
+    train_data$phenotype
+)
+
+test_accuracy <- mean(
+  pred_test_class ==
+    test_data$phenotype
+)
+
+
+############################################################
+# 40. PRINT PERFORMANCE
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "MODEL PERFORMANCE\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+cat(
+  "Training AUC ROC   :",
+  train_AUC_ROC,
+  "\n"
+)
+
+cat(
+  "Testing AUC ROC    :",
+  test_AUC_ROC,
+  "\n\n"
+)
+
+
+cat(
+  "Training Brier     :",
+  train_Brier_Score,
+  "\n"
+)
+
+cat(
+  "Testing Brier      :",
+  test_Brier_Score,
+  "\n\n"
+)
+
+
+cat(
+  "Training Log Loss  :",
+  train_Log_Loss,
+  "\n"
+)
+
+cat(
+  "Testing Log Loss   :",
+  test_Log_Loss,
+  "\n\n"
+)
+
+
+cat(
+  "Training Accuracy  :",
+  train_accuracy,
+  "\n"
+)
+
+cat(
+  "Testing Accuracy   :",
+  test_accuracy,
+  "\n"
+)
+
+
+############################################################
+# 41. CREATE SNP MATRICES
+############################################################
+
+X_train <- train_data[
+  ,
+  selected_snps,
+  drop = FALSE
+]
+
+X_test <- test_data[
+  ,
+  selected_snps,
+  drop = FALSE
+]
+
+
+X_train_matrix <- as.matrix(
+  X_train
+)
+
+storage.mode(
+  X_train_matrix
+) <- "numeric"
+
+
+X_test_matrix <- as.matrix(
+  X_test
+)
+
+storage.mode(
+  X_test_matrix
+) <- "numeric"
+
+
+############################################################
+# 42. STANDARDIZE TRAINING MATRIX
+############################################################
+
+X_train_standardized <- sweep(
+  X_train_matrix,
+  2,
+  as.numeric(
+    preprocess_mean
+  ),
+  FUN = "-"
+)
+
+X_train_standardized <- sweep(
+  X_train_standardized,
+  2,
+  as.numeric(
+    preprocess_sd
+  ),
+  FUN = "/"
+)
+
+
+############################################################
+# 43. STANDARDIZE TEST MATRIX
+############################################################
+
+X_test_standardized <- sweep(
+  X_test_matrix,
+  2,
+  as.numeric(
+    preprocess_mean
+  ),
+  FUN = "-"
+)
+
+X_test_standardized <- sweep(
+  X_test_standardized,
+  2,
+  as.numeric(
+    preprocess_sd
+  ),
+  FUN = "/"
+)
+
+
+############################################################
+# 44. EXTRACT LINEAR SVM SUPPORT VECTORS
+############################################################
+
+SV <- final_model$SV
+
+
+############################################################
+# 45. EXTRACT LINEAR SVM COEFFICIENTS
+############################################################
+
+coefs <- final_model$coefs
+
+
+############################################################
+# 46. EXTRACT SVM RHO
+############################################################
+
+rho <- as.numeric(
+  final_model$rho
+)
+
+
+############################################################
+# 47. EXTRACT STANDARDIZED SVM WEIGHTS
+#
+# For the linear e1071 SVM:
+#
+# f(x) = sum(w_j * x_j) - rho
+#
+# where:
+#
+# w = sum_i alpha_i * y_i * SV_i
+############################################################
+
+w_standardized <- as.numeric(
+  crossprod(
+    coefs[, 1],
+    SV
+  )
+)
+
+names(
+  w_standardized
+) <- selected_snps
+
+
+############################################################
+# 48. DISPLAY STANDARDIZED COEFFICIENTS
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "STANDARDIZED SVM DECISION-FUNCTION COEFFICIENTS\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+print(
+  w_standardized
+)
+
+
+############################################################
+# 49. ORIGINAL-SCALE COEFFICIENTS
+############################################################
+
+beta_original <-
+  w_standardized /
+  as.numeric(
+    preprocess_sd
+  )
+
+names(
+  beta_original
+) <- selected_snps
+
+
+############################################################
+# 50. ORIGINAL-SCALE DECISION INTERCEPT
+############################################################
+
+intercept_original <-
+  -rho -
+  sum(
+    w_standardized *
+      as.numeric(
+        preprocess_mean
+      ) /
+      as.numeric(
+        preprocess_sd
+      )
+  )
+
+
+############################################################
+# 51. CREATE COEFFICIENT TABLE
+############################################################
+
+coefficient_table <- data.frame(
+  
+  SNP = selected_snps,
+  
+  Mean = as.numeric(
+    preprocess_mean
+  ),
+  
+  SD = as.numeric(
+    preprocess_sd
+  ),
+  
+  Coefficient_standardized =
+    as.numeric(
+      w_standardized
+    ),
+  
+  Coefficient_original =
+    as.numeric(
+      beta_original
+    ),
+  
+  stringsAsFactors = FALSE,
+  
+  check.names = FALSE
+  
+)
+
+
+############################################################
+# 52. ABSOLUTE COEFFICIENTS
+############################################################
+
+coefficient_table$Absolute_coefficient_standardized <-
+  abs(
+    coefficient_table$
+      Coefficient_standardized
+  )
+
+
+coefficient_table$Absolute_coefficient_original <-
+  abs(
+    coefficient_table$
+      Coefficient_original
+  )
+
+
+############################################################
+# 53. SORT BY ABSOLUTE EFFECT
+############################################################
+
+coefficient_table_sorted <-
+  coefficient_table[
+    order(
+      -coefficient_table$
+        Absolute_coefficient_standardized
+    ),
+    ,
+    drop = FALSE
+  ]
+
+
+############################################################
+# 54. DISPLAY SNP COEFFICIENTS
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "SNP COEFFICIENTS\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+print(
+  coefficient_table_sorted,
+  row.names = FALSE
+)
+
+
+############################################################
+# 55. BUILD STANDARDIZED DECISION-FUNCTION FORMULA
+#
+# f(z) = -rho + sum(w_j * z_j)
+#
+# z_j = (SNP_j - mean_j) / SD_j
+############################################################
+
+standardized_formula <- paste0(
+  "Decision_score = ",
+  format(
+    -rho,
+    digits = 15
+  )
+)
+
+
+for (j in seq_along(w_standardized)) {
+  
+  coefficient <- w_standardized[j]
+  
+  sign_symbol <- ifelse(
+    coefficient >= 0,
+    " + ",
+    " - "
+  )
+  
+  standardized_formula <- paste0(
+    standardized_formula,
+    sign_symbol,
+    format(
+      abs(coefficient),
+      digits = 15
+    ),
+    " * (( ",
+    selected_snps[j],
+    " - ",
+    format(
+      preprocess_mean[j],
+      digits = 15
+    ),
+    " ) / ",
+    format(
+      preprocess_sd[j],
+      digits = 15
+    ),
+    ")"
+  )
+  
+}
+
+
+############################################################
+# 56. BUILD ORIGINAL-SCALE DECISION-FUNCTION FORMULA
+############################################################
+
+original_formula <- paste0(
+  "Decision_score = ",
+  format(
+    intercept_original,
+    digits = 15
+  )
+)
+
+
+for (j in seq_along(beta_original)) {
+  
+  coefficient <- beta_original[j]
+  
+  sign_symbol <- ifelse(
+    coefficient >= 0,
+    " + ",
+    " - "
+  )
+  
+  original_formula <- paste0(
+    original_formula,
+    sign_symbol,
+    format(
+      abs(coefficient),
+      digits = 15
+    ),
+    " * ",
+    selected_snps[j]
+  )
+  
+}
+
+
+############################################################
+# 57. PRINT FORMULAS
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "LINEAR SVM DECISION FUNCTION\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+cat(
+  "STANDARDIZED FORM:\n\n"
+)
+
+cat(
+  standardized_formula,
+  "\n\n"
+)
+
+
+cat(
+  "ORIGINAL SNP SCALE:\n\n"
+)
+
+cat(
+  original_formula,
+  "\n\n"
+)
+
+
+cat(
+  "Standardized decision intercept:",
+  -rho,
+  "\n"
+)
+
+
+cat(
+  "Original-scale intercept:",
+  intercept_original,
+  "\n"
+)
+
+
+############################################################
+# 58. FORMULA-BASED TRAINING DECISION SCORES
+############################################################
+
+pred_train_decision_formula <-
+  as.numeric(
+    X_train_standardized %*%
+      w_standardized
+  ) -
+  rho
+
+
+############################################################
+# 59. FORMULA-BASED TESTING DECISION SCORES
+############################################################
+
+pred_test_decision_formula <-
+  as.numeric(
+    X_test_standardized %*%
+      w_standardized
+  ) -
+  rho
+
+
+############################################################
+# 60. DIRECT e1071 SVM DECISION SCORES
+#
+# e1071::predict.svm does not use type = "decision".
+# Decision values are obtained with decision.values = TRUE.
+############################################################
+
+pred_train_svm <- predict(
+  final_model,
+  newdata = X_train_standardized,
+  decision.values = TRUE
+)
+
+pred_test_svm <- predict(
+  final_model,
+  newdata = X_test_standardized,
+  decision.values = TRUE
+)
+
+
+pred_train_decision <- as.numeric(
+  attr(
+    pred_train_svm,
+    "decision.values"
+  )
+)
+
+pred_test_decision <- as.numeric(
+  attr(
+    pred_test_svm,
+    "decision.values"
+  )
+)
+
+
+############################################################
+# 61. FORMULA RECONSTRUCTION CHECK
+############################################################
+
+train_difference <-
+  pred_train_decision -
+  pred_train_decision_formula
+
+
+test_difference <-
+  pred_test_decision -
+  pred_test_decision_formula
+
+
+max_train_difference <-
+  max(
+    abs(
+      train_difference
+    )
+  )
+
+
+max_test_difference <-
+  max(
+    abs(
+      test_difference
+    )
+  )
+
+
+mean_train_difference <-
+  mean(
+    abs(
+      train_difference
+    )
+  )
+
+
+mean_test_difference <-
+  mean(
+    abs(
+      test_difference
+    )
+  )
+
+
+tolerance <- 1e-8
+
+
+formula_matches_train <-
+  max_train_difference <
+  tolerance
+
+
+formula_matches_test <-
+  max_test_difference <
+  tolerance
+
+
+############################################################
+# 62. PRINT RECONSTRUCTION CHECK
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "FORMULA RECONSTRUCTION CHECK\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+cat(
+  "Maximum absolute difference - TRAIN:",
+  max_train_difference,
+  "\n"
+)
+
+
+cat(
+  "Mean absolute difference - TRAIN:",
+  mean_train_difference,
+  "\n\n"
+)
+
+
+cat(
+  "Maximum absolute difference - TEST:",
+  max_test_difference,
+  "\n"
+)
+
+
+cat(
+  "Mean absolute difference - TEST:",
+  mean_test_difference,
+  "\n\n"
+)
+
+
+cat(
+  "Formula reproduces TRAIN decision scores:",
+  formula_matches_train,
+  "\n"
+)
+
+
+cat(
+  "Formula reproduces TEST decision scores:",
+  formula_matches_test,
+  "\n"
+)
+
+
+############################################################
+# 63. CALCULATE TRAINING SNP CONTRIBUTIONS
+############################################################
+
+train_contributions <- sweep(
+  X_train_standardized,
+  2,
+  w_standardized,
+  FUN = "*"
+)
+
+
+train_contributions <- as.data.frame(
+  train_contributions,
+  check.names = FALSE
+)
+
+
+colnames(
+  train_contributions
+) <- selected_snps
+
+
+############################################################
+# 64. CALCULATE TESTING SNP CONTRIBUTIONS
+############################################################
+
+test_contributions <- sweep(
+  X_test_standardized,
+  2,
+  w_standardized,
+  FUN = "*"
+)
+
+
+test_contributions <- as.data.frame(
+  test_contributions,
+  check.names = FALSE
+)
+
+
+colnames(
+  test_contributions
+) <- selected_snps
+
+
+############################################################
+# 65. CHECK CONTRIBUTION SUMS
+############################################################
+
+train_contribution_sum <-
+  -rho +
+  rowSums(
+    train_contributions
+  )
+
+
+test_contribution_sum <-
+  -rho +
+  rowSums(
+    test_contributions
+  )
+
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "CONTRIBUTION CHECK\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+cat(
+  "Maximum train difference:",
+  max(
+    abs(
+      pred_train_decision -
+        train_contribution_sum
+    )
+  ),
+  "\n"
+)
+
+
+cat(
+  "Maximum test difference:",
+  max(
+    abs(
+      pred_test_decision -
+        test_contribution_sum
+    )
+  ),
+  "\n"
+)
+
+
+############################################################
+# 66. TRAIN CONTRIBUTION TABLE
+############################################################
+
+train_contribution_table <- data.frame(
+  
+  phenotype_observed = y_train,
+  
+  Intercept_decision = -rho,
+  
+  train_contributions,
+  
+  Decision_score = pred_train_decision,
+  
+  Probability_Class1 = prob_train,
+  
+  Predicted_class =
+    as.character(
+      pred_train_class
+    ),
+  
+  stringsAsFactors = FALSE,
+  
+  check.names = FALSE
+  
+)
+
+
+############################################################
+# 67. TEST CONTRIBUTION TABLE
+############################################################
+
+test_contribution_table <- data.frame(
+  
+  phenotype_observed = y_test,
+  
+  Intercept_decision = -rho,
+  
+  test_contributions,
+  
+  Decision_score = pred_test_decision,
+  
+  Probability_Class1 = prob_test,
+  
+  Predicted_class =
+    as.character(
+      pred_test_class
+    ),
+  
+  stringsAsFactors = FALSE,
+  
+  check.names = FALSE
+  
+)
+
+
+############################################################
+# 68. ADD PREDICTION ERROR
+############################################################
+
+train_contribution_table$Error_probability <-
+  y_train -
+  prob_train
+
+
+train_contribution_table$Absolute_error_probability <-
+  abs(
+    train_contribution_table$
+      Error_probability
+  )
+
+
+test_contribution_table$Error_probability <-
+  y_test -
+  prob_test
+
+
+test_contribution_table$Absolute_error_probability <-
+  abs(
+    test_contribution_table$
+      Error_probability
+  )
+
+
+############################################################
+# 69. STANDARDIZED GENOTYPE TABLES
+############################################################
+
+train_standardized_table <- data.frame(
+  X_train_standardized,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+
+test_standardized_table <- data.frame(
+  X_test_standardized,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+
+############################################################
+# 70. ORIGINAL GENOTYPE TABLES
+############################################################
+
+train_genotype_table <- data.frame(
+  X_train,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+
+test_genotype_table <- data.frame(
+  X_test,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+
+############################################################
+# 71. TRAINING PREDICTION TABLE
+############################################################
+
+train_prediction_table <- data.frame(
+  
+  Observed_phenotype = y_train,
+  
+  Predicted_probability_Class1 =
+    prob_train,
+  
+  Predicted_class =
+    as.character(
+      pred_train_class
+    ),
+  
+  Decision_score =
+    pred_train_decision,
+  
+  Error_probability =
+    y_train -
+    prob_train,
+  
+  Absolute_error_probability =
+    abs(
+      y_train -
+        prob_train
+    ),
+  
+  stringsAsFactors = FALSE
+  
+)
+
+
+############################################################
+# 72. TESTING PREDICTION TABLE
+############################################################
+
+test_prediction_table <- data.frame(
+  
+  Observed_phenotype = y_test,
+  
+  Predicted_probability_Class1 =
+    prob_test,
+  
+  Predicted_class =
+    as.character(
+      pred_test_class
+    ),
+  
+  Decision_score =
+    pred_test_decision,
+  
+  Error_probability =
+    y_test -
+    prob_test,
+  
+  Absolute_error_probability =
+    abs(
+      y_test -
+        prob_test
+    ),
+  
+  stringsAsFactors = FALSE
+  
+)
+
+
+############################################################
+# 73. PERFORMANCE TABLE
+############################################################
+
+performance_table <- data.frame(
+  
+  Dataset = c(
+    "Training",
+    "Testing"
+  ),
+  
+  AUC_ROC = c(
+    train_AUC_ROC,
+    test_AUC_ROC
+  ),
+  
+  Brier_Score = c(
+    train_Brier_Score,
+    test_Brier_Score
+  ),
+  
+  Log_Loss = c(
+    train_Log_Loss,
+    test_Log_Loss
+  ),
+  
+  Accuracy = c(
+    train_accuracy,
+    test_accuracy
+  ),
+  
+  N = c(
+    nrow(train_data),
+    nrow(test_data)
+  ),
+  
+  stringsAsFactors = FALSE
+  
+)
+
+
+############################################################
+# 74. MODEL INFORMATION TABLE
+############################################################
+
+model_information <- data.frame(
+  
+  Parameter = c(
+    
+    "Model",
+    
+    "Kernel",
+    
+    "Cost",
+    
+    "Number_of_SNPs",
+    
+    "Training_samples",
+    
+    "Testing_samples",
+    
+    "Positive_class",
+    
+    "Negative_class",
+    
+    "Cross_validation",
+    
+    "CV_folds",
+    
+    "CV_repeats",
+    
+    "Standardized_decision_intercept",
+    
+    "Original_scale_decision_intercept",
+    
+    "Number_of_support_vectors",
+    
+    "Formula_matches_training",
+    
+    "Formula_matches_testing",
+    
+    "Max_training_difference",
+    
+    "Max_testing_difference",
+    
+    "Training_AUC_ROC",
+    
+    "Testing_AUC_ROC",
+    
+    "Training_Brier_Score",
+    
+    "Testing_Brier_Score",
+    
+    "Training_Log_Loss",
+    
+    "Testing_Log_Loss"
+    
+  ),
+  
+  Value = c(
+    
+    "svmLinear2",
+    
+    "linear",
+    
+    as.character(
+      svm_model$bestTune$cost
+    ),
+    
+    as.character(
+      length(selected_snps)
+    ),
+    
+    as.character(
+      nrow(train_data)
+    ),
+    
+    as.character(
+      nrow(test_data)
+    ),
+    
+    "Class1 / phenotype = 1",
+    
+    "Class0 / phenotype = 0",
+    
+    "repeatedcv",
+    
+    "10",
+    
+    "5",
+    
+    as.character(
+      -rho
+    ),
+    
+    as.character(
+      intercept_original
+    ),
+    
+    as.character(
+      nrow(final_model$SV)
+    ),
+    
+    as.character(
+      formula_matches_train
+    ),
+    
+    as.character(
+      formula_matches_test
+    ),
+    
+    as.character(
+      max_train_difference
+    ),
+    
+    as.character(
+      max_test_difference
+    ),
+    
+    as.character(
+      train_AUC_ROC
+    ),
+    
+    as.character(
+      test_AUC_ROC
+    ),
+    
+    as.character(
+      train_Brier_Score
+    ),
+    
+    as.character(
+      test_Brier_Score
+    ),
+    
+    as.character(
+      train_Log_Loss
+    ),
+    
+    as.character(
+      test_Log_Loss
+    )
+    
+  ),
+  
+  stringsAsFactors = FALSE
+  
+)
+
+
+############################################################
+# 75. PREPROCESSING PARAMETERS
+############################################################
+
+preprocessing_table <- data.frame(
+  
+  SNP = selected_snps,
+  
+  Mean =
+    as.numeric(
+      preprocess_mean
+    ),
+  
+  SD =
+    as.numeric(
+      preprocess_sd
+    ),
+  
+  stringsAsFactors = FALSE,
+  
+  check.names = FALSE
+  
+)
+
+
+############################################################
+# 76. SAVE COEFFICIENT TABLE
+############################################################
+
+write.csv(
+  coefficient_table,
+  "SVM_binary_SNP_coefficients.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  coefficient_table_sorted,
+  "SVM_binary_SNP_coefficients_sorted_by_effect.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 77. SAVE PREPROCESSING PARAMETERS
+############################################################
+
+write.csv(
+  preprocessing_table,
+  "SVM_binary_preprocessing_parameters.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 78. SAVE STANDARDIZED GENOTYPES
+############################################################
+
+write.csv(
+  train_standardized_table,
+  "SVM_binary_train_standardized_SNPs.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  test_standardized_table,
+  "SVM_binary_test_standardized_SNPs.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 79. SAVE ORIGINAL GENOTYPES
+############################################################
+
+write.csv(
+  train_genotype_table,
+  "SVM_binary_train_original_SNPs.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  test_genotype_table,
+  "SVM_binary_test_original_SNPs.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 80. SAVE INDIVIDUAL SNP CONTRIBUTIONS
+############################################################
+
+write.csv(
+  train_contribution_table,
+  "SVM_binary_train_SNP_contributions.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  test_contribution_table,
+  "SVM_binary_test_SNP_contributions.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 81. SAVE PREDICTIONS
+############################################################
+
+write.csv(
+  train_prediction_table,
+  "SVM_binary_train_predictions.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  test_prediction_table,
+  "SVM_binary_test_predictions.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 82. SAVE PROBABILITIES
+############################################################
+
+train_probability_table <- data.frame(
+  
+  Observed_phenotype = y_train,
+  
+  Probability_Class0 =
+    pred_train_prob$Class0,
+  
+  Probability_Class1 =
+    pred_train_prob$Class1,
+  
+  Predicted_class =
+    as.character(
+      pred_train_class
+    ),
+  
+  Decision_score =
+    pred_train_decision,
+  
+  stringsAsFactors = FALSE
+  
+)
+
+
+test_probability_table <- data.frame(
+  
+  Observed_phenotype = y_test,
+  
+  Probability_Class0 =
+    pred_test_prob$Class0,
+  
+  Probability_Class1 =
+    pred_test_prob$Class1,
+  
+  Predicted_class =
+    as.character(
+      pred_test_class
+    ),
+  
+  Decision_score =
+    pred_test_decision,
+  
+  stringsAsFactors = FALSE
+  
+)
+
+
+write.csv(
+  train_probability_table,
+  "SVM_binary_train_probabilities.csv",
+  row.names = FALSE
+)
+
+
+write.csv(
+  test_probability_table,
+  "SVM_binary_test_probabilities.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 83. SAVE PERFORMANCE
+############################################################
+
+write.csv(
+  performance_table,
+  "SVM_binary_performance.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 84. SAVE MODEL INFORMATION
+############################################################
+
+write.csv(
+  model_information,
+  "SVM_binary_model_information.csv",
+  row.names = FALSE
+)
+
+
+############################################################
+# 85. SAVE DECISION-FUNCTION FORMULAS
+############################################################
+
+formula_file <- file(
+  "SVM_binary_formula.txt",
+  open = "wt"
+)
+
+
+writeLines(
+  "============================================================",
+  formula_file
+)
+
+writeLines(
+  "BINARY LINEAR SVM DECISION FUNCTION",
+  formula_file
+)
+
+writeLines(
+  "============================================================",
+  formula_file
+)
+
+writeLines(
+  "",
+  formula_file
+)
+
+writeLines(
+  "IMPORTANT:",
+  formula_file
+)
+
+writeLines(
+  "The formulas below describe the LINEAR SVM DECISION SCORE.",
+  formula_file
+)
+
+writeLines(
+  "They are not direct formulas for probability.",
+  formula_file
+)
+
+writeLines(
+  "",
+  formula_file
+)
+
+writeLines(
+  "STANDARDIZED FORM:",
+  formula_file
+)
+
+writeLines(
+  standardized_formula,
+  formula_file
+)
+
+writeLines(
+  "",
+  formula_file
+)
+
+writeLines(
+  "ORIGINAL SNP SCALE:",
+  formula_file
+)
+
+writeLines(
+  original_formula,
+  formula_file
+)
+
+writeLines(
+  "",
+  formula_file
+)
+
+writeLines(
+  paste0(
+    "Standardized decision intercept = ",
+    -rho
+  ),
+  formula_file
+)
+
+writeLines(
+  paste0(
+    "Original-scale intercept = ",
+    intercept_original
+  ),
+  formula_file
+)
+
+writeLines(
+  "",
+  formula_file
+)
+
+writeLines(
+  "============================================================",
+  formula_file
+)
+
+writeLines(
+  "FORMULA RECONSTRUCTION CHECK",
+  formula_file
+)
+
+writeLines(
+  "============================================================",
+  formula_file
+)
+
+writeLines(
+  paste0(
+    "Maximum absolute difference, training = ",
+    max_train_difference
+  ),
+  formula_file
+)
+
+writeLines(
+  paste0(
+    "Maximum absolute difference, testing = ",
+    max_test_difference
+  ),
+  formula_file
+)
+
+writeLines(
+  paste0(
+    "Formula reproduces training decision scores = ",
+    formula_matches_train
+  ),
+  formula_file
+)
+
+writeLines(
+  paste0(
+    "Formula reproduces testing decision scores = ",
+    formula_matches_test
+  ),
+  formula_file
+)
+
+
+close(
+  formula_file
+)
+
+
+############################################################
+# 86. SAVE DETAILED COEFFICIENT FILE
+############################################################
+
+coefficient_file <- file(
+  "SVM_binary_detailed_SNP_coefficients.txt",
+  open = "wt"
+)
+
+
+writeLines(
+  "============================================================",
+  coefficient_file
+)
+
+writeLines(
+  "DETAILED BINARY LINEAR SVM SNP COEFFICIENTS",
+  coefficient_file
+)
+
+writeLines(
+  "============================================================",
+  coefficient_file
+)
+
+writeLines(
+  "",
+  coefficient_file
+)
+
+writeLines(
+  "Coefficients refer to the linear SVM decision function.",
+  coefficient_file
+)
+
+writeLines(
+  "",
+  coefficient_file
+)
+
+writeLines(
+  paste0(
+    "Standardized decision intercept = ",
+    -rho
+  ),
+  coefficient_file
+)
+
+writeLines(
+  paste0(
+    "Original-scale decision intercept = ",
+    intercept_original
+  ),
+  coefficient_file
+)
+
+writeLines(
+  "",
+  coefficient_file
+)
+
+
+for (j in seq_along(w_standardized)) {
+  
+  snp_name <- selected_snps[j]
+  
+  writeLines(
+    paste0(
+      "SNP: ",
+      snp_name
+    ),
+    coefficient_file
+  )
+  
+  writeLines(
+    paste0(
+      "  Mean = ",
+      preprocess_mean[j]
+    ),
+    coefficient_file
+  )
+  
+  writeLines(
+    paste0(
+      "  SD = ",
+      preprocess_sd[j]
+    ),
+    coefficient_file
+  )
+  
+  writeLines(
+    paste0(
+      "  Standardized decision coefficient = ",
+      w_standardized[j]
+    ),
+    coefficient_file
+  )
+  
+  writeLines(
+    paste0(
+      "  Original-scale decision coefficient = ",
+      beta_original[j]
+    ),
+    coefficient_file
+  )
+  
+  writeLines(
+    "",
+    coefficient_file
+  )
+  
+}
+
+
+close(
+  coefficient_file
+)
+
+
+############################################################
+# 87. SAVE TRAINED CARET MODEL
+############################################################
+
+saveRDS(
+  svm_model,
+  "SVM_binary_linear_model.rds"
+)
+
+
+############################################################
+# 88. SAVE FINAL e1071 MODEL
+############################################################
+
+saveRDS(
+  final_model,
+  "SVM_binary_linear_final_e1071_model.rds"
+)
+
+
+############################################################
+# 89. COMPLETE ANALYSIS OBJECT
+############################################################
+
+analysis_results <- list(
+  
+  model = svm_model,
+  
+  final_model = final_model,
+  
+  best_tune =
+    svm_model$bestTune,
+  
+  selected_snps =
+    selected_snps,
+  
+  preprocessing_mean =
+    preprocess_mean,
+  
+  preprocessing_sd =
+    preprocess_sd,
+  
+  standardized_coefficients =
+    w_standardized,
+  
+  original_coefficients =
+    beta_original,
+  
+  standardized_decision_intercept =
+    -rho,
+  
+  original_decision_intercept =
+    intercept_original,
+  
+  rho =
+    rho,
+  
+  support_vectors =
+    SV,
+  
+  standardized_formula =
+    standardized_formula,
+  
+  original_formula =
+    original_formula,
+  
+  train_probability =
+    prob_train,
+  
+  test_probability =
+    prob_test,
+  
+  train_decision_score =
+    pred_train_decision,
+  
+  test_decision_score =
+    pred_test_decision,
+  
+  train_predictions =
+    pred_train_class,
+  
+  test_predictions =
+    pred_test_class,
+  
+  train_AUC_ROC =
+    train_AUC_ROC,
+  
+  test_AUC_ROC =
+    test_AUC_ROC,
+  
+  train_Brier_Score =
+    train_Brier_Score,
+  
+  test_Brier_Score =
+    test_Brier_Score,
+  
+  train_Log_Loss =
+    train_Log_Loss,
+  
+  test_Log_Loss =
+    test_Log_Loss,
+  
+  train_accuracy =
+    train_accuracy,
+  
+  test_accuracy =
+    test_accuracy,
+  
+  coefficient_table =
+    coefficient_table,
+  
+  train_contributions =
+    train_contribution_table,
+  
+  test_contributions =
+    test_contribution_table,
+  
+  formula_matches_train =
+    formula_matches_train,
+  
+  formula_matches_test =
+    formula_matches_test,
+  
+  max_train_difference =
+    max_train_difference,
+  
+  max_test_difference =
+    max_test_difference
+  
+)
+
+
+saveRDS(
+  analysis_results,
+  "SVM_binary_complete_analysis_results.rds"
+)
+
+
+############################################################
+# 90. PRINT TOP SNPs
+############################################################
+
+cat(
+  "\n========================================\n"
+)
+
+cat(
+  "TOP SNPs BY ABSOLUTE STANDARDIZED EFFECT\n"
+)
+
+cat(
+  "========================================\n\n"
+)
+
+
+print(
+  head(
+    coefficient_table_sorted,
+    21
+  ),
+  row.names = FALSE
+)
+
+
+############################################################
+# 91. FINAL SUMMARY
+############################################################
+
+cat(
+  "\n\n"
+)
+
+cat(
+  "============================================================\n"
+)
+
+cat(
+  "BINARY SVM ANALYSIS COMPLETE\n"
+)
+
+cat(
+  "============================================================\n\n"
+)
+
+
+cat(
+  "Number of training samples:",
+  nrow(train_data),
+  "\n"
+)
+
+
+cat(
+  "Number of testing samples:",
+  nrow(test_data),
+  "\n"
+)
+
+
+cat(
+  "Number of SNPs:",
+  length(selected_snps),
+  "\n\n"
+)
+
+
+cat(
+  "Best SVM cost:",
+  svm_model$bestTune$cost,
+  "\n"
+)
+
+
+cat(
+  "Number of support vectors:",
+  nrow(final_model$SV),
+  "\n\n"
+)
+
+
+cat(
+  "Training AUC ROC:",
+  train_AUC_ROC,
+  "\n"
+)
+
+
+cat(
+  "Testing AUC ROC:",
+  test_AUC_ROC,
+  "\n\n"
+)
+
+
+cat(
+  "Training Brier Score:",
+  train_Brier_Score,
+  "\n"
+)
+
+
+cat(
+  "Testing Brier Score:",
+  test_Brier_Score,
+  "\n\n"
+)
+
+
+cat(
+  "Training Log Loss:",
+  train_Log_Loss,
+  "\n"
+)
+
+
+cat(
+  "Testing Log Loss:",
+  test_Log_Loss,
+  "\n\n"
+)
+
+
+cat(
+  "Training Accuracy:",
+  train_accuracy,
+  "\n"
+)
+
+
+cat(
+  "Testing Accuracy:",
+  test_accuracy,
+  "\n\n"
+)
+
+
+cat(
+  "Standardized decision intercept:",
+  -rho,
+  "\n"
+)
+
+
+cat(
+  "Original-scale decision intercept:",
+  intercept_original,
+  "\n\n"
+)
+
+
+cat(
+  "Formula reconstruction max error - TRAIN:",
+  max_train_difference,
+  "\n"
+)
+
+
+cat(
+  "Formula reconstruction max error - TEST:",
+  max_test_difference,
+  "\n\n"
+)
+
+
+cat(
+  "Formula reproduces TRAIN decision scores:",
+  formula_matches_train,
+  "\n"
+)
+
+
+cat(
+  "Formula reproduces TEST decision scores:",
+  formula_matches_test,
+  "\n\n"
+)
+
+
+cat(
+  "Formula saved to: SVM_binary_formula.txt\n"
+)
+
+cat(
+  "Coefficients saved to: SVM_binary_SNP_coefficients.csv\n"
+)
+
+cat(
+  "Individual contributions saved to:",
+  "SVM_binary_test_SNP_contributions.csv\n"
+)
+
+cat(
+  "Performance saved to: SVM_binary_performance.csv\n"
+)
+
+cat(
+  "Complete model saved to:",
+  "SVM_binary_complete_analysis_results.rds\n"
+)
+
+cat(
+  "Prediction table saved to:",
+  "SVM_binary_test_predictions.csv\n"
+)
+
+
+############################################################
+# 92. STOP PARALLEL CLUSTER
+############################################################
+
+stopCluster(
+  cl
+)
+
+registerDoSEQ()
+
+##
+## SYMBOLIC REGRESSION (fenotipo binario)
+##
+library(gramEvol)
+library(data.table)
+library(parallel)
+library(pbapply)
+library(pROC)
+
+# ------------------------------------------------------------
+# 1. Imposta numero di thread e cluster parallelo
+# ------------------------------------------------------------
+total_threads <- parallel::detectCores(logical = TRUE)
+num_cores <- max(1, total_threads - 1)
+
+# One data.table thread per worker to avoid oversubscription
+setDTthreads(1)
+
+print(paste0(
+  "Available logical threads: ", total_threads,
+  " | Parallel workers: ", num_cores
+))
+
+print("Creating cluster...")
+cl <- makeCluster(num_cores)
+print("Cluster created successfully.")
+
+# ------------------------------------------------------------
+# 2. Carica dataset
+# ------------------------------------------------------------
+print("Loading datasets...")
+
+features_selected <- fread("selected_SNPs.txt", header = FALSE)
+marker_names <- features_selected$V1
+
+df_train_fs <- fread("train_selected_SNPs.csv")
+df_test_fs  <- fread("test_selected_SNPs.csv")
+
+print("Datasets loaded successfully.")
+
+# Check phenotype
+if (!"phenotype" %in% names(df_train_fs)) {
+  stop("Column 'phenotype' not found in train_selected_SNPs.csv")
+}
+
+if (!"phenotype" %in% names(df_test_fs)) {
+  stop("Column 'phenotype' not found in test_selected_SNPs.csv")
+}
+
+# Keep only selected SNPs + phenotype
+missing_train <- setdiff(marker_names, names(df_train_fs))
+missing_test  <- setdiff(marker_names, names(df_test_fs))
+
+if (length(missing_train) > 0) {
+  stop("The following selected SNPs are missing from the training dataset: ",
+       paste(missing_train, collapse = ", "))
+}
+
+if (length(missing_test) > 0) {
+  stop("The following selected SNPs are missing from the test dataset: ",
+       paste(missing_test, collapse = ", "))
+}
+
+lm_data <- df_train_fs[, c(marker_names, "phenotype"), with = FALSE]
+test_data <- df_test_fs[, c(marker_names, "phenotype"), with = FALSE]
+
+# Make sure phenotype is binary numeric 0/1
+lm_data[, phenotype := as.numeric(phenotype)]
+test_data[, phenotype := as.numeric(phenotype)]
+
+if (!all(na.omit(lm_data$phenotype) %in% c(0, 1))) {
+  stop("Training phenotype must contain only 0/1 values.")
+}
+
+if (!all(na.omit(test_data$phenotype) %in% c(0, 1))) {
+  stop("Test phenotype must contain only 0/1 values.")
+}
+
+print(paste0("Training samples: ", nrow(lm_data)))
+print(paste0("Test samples: ", nrow(test_data)))
+print(paste0("Selected SNPs: ", length(marker_names)))
+
+# ------------------------------------------------------------
+# 3. Funzione principale per ogni seed
+# ------------------------------------------------------------
+run_single_seed <- function(i, lm_data, test_data, marker_names) {
+
+  library(gramEvol)
+  library(data.table)
+
+  print(paste0("Running seed ", i))
+  set.seed(i)
+
+  # --- Funzioni sicure ---
+  safe_log <- function(x) ifelse(x <= 0, 0, log(x))
+  safe_sqrt <- function(x) ifelse(x < 0, 0, sqrt(x))
+  safe_div <- function(x, y) ifelse(y == 0, 0, x / y)
+
+  # --- Crea grammatica ---
+  ruleDef <- list(
+    expr = gsrule(
+      "<expr><op><expr>",
+      "<func>(<expr>)",
+      "<var>",
+      "<const>"
+    ),
+    op = gsrule("+", "-", "*", "/"),
+    func = grule(sin, safe_log, exp, safe_sqrt),
+    var = do.call(grule, as.list(marker_names)),
+    const = grule(1, 2, 3)
+  )
+
+  grammarDef <- CreateGrammar(ruleDef)
+
+  # --- Funzione di valutazione ---
+  evalFunc <- function(expr) {
+
+    tryCatch({
+
+      for (m in marker_names) {
+        expr <- gsub(paste0('"', m, '"'), m, expr, fixed = TRUE)
+        expr <- gsub(paste0("'", m, "'"), m, expr, fixed = TRUE)
+      }
+
+      e <- parse(text = expr)
+      score <- eval(e, envir = lm_data)
+      y <- lm_data$phenotype
+
+      if (length(score) != length(y) ||
+          !is.numeric(score) ||
+          any(!is.finite(score))) {
+        return(1e10)
+      }
+
+      # Convert symbolic-regression score to probability
+      prob <- plogis(score)
+
+      if (any(!is.finite(prob))) {
+        return(1e10)
+      }
+
+      # Log Loss
+      eps <- 1e-15
+      prob <- pmin(pmax(prob, eps), 1 - eps)
+
+      logloss <- -mean(
+        y * log(prob) + (1 - y) * log(1 - prob)
+      )
+
+      # Penalità per complessità
+      n_terms <- length(strsplit(expr, split = "\\+|-|\\*")[[1]])
+      n_ops <- length(gregexpr("\\+|-|\\*", expr)[[1]])
+
+      if (n_ops < 0) n_ops <- 0
+
+      lambda <- 3
+      cost <- logloss + lambda * (n_terms + n_ops)
+
+      return(cost)
+
+    }, error = function(e) {
+      return(1e10)
+    })
+  }
+
+  # --- Esecuzione grammaticale ---
+  ge <- GrammaticalEvolution(
+    grammarDef,
+    evalFunc,
+    iterations = 1000,
+    popSize = 300,
+    newPerGen = 15,
+    elitism = 3,
+    mutationChance = 0.3,
+    optimizer = "ga"
+  )
+
+  best_expr <- as.character(ge$best$expressions)
+
+  # ----------------------------------------------------------
+  # Funzione per calcolare metriche
+  # ----------------------------------------------------------
+  compute_metrics <- function(expr, data) {
+
+    tryCatch({
+
+      y <- data$phenotype
+
+      for (m in marker_names) {
+        expr <- gsub(paste0('"', m, '"'), m, expr, fixed = TRUE)
+        expr <- gsub(paste0("'", m, "'"), m, expr, fixed = TRUE)
+      }
+
+      e <- parse(text = expr)
+      score <- eval(e, envir = data)
+
+      if (length(score) != length(y) ||
+          !is.numeric(score) ||
+          any(!is.finite(score))) {
+
+        return(list(
+          AUC_ROC = NA,
+          Brier_Score = NA,
+          Log_Loss = NA
+        ))
+      }
+
+      # Convert symbolic score to probability
+      prob <- plogis(score)
+
+      if (any(!is.finite(prob))) {
+        return(list(
+          AUC_ROC = NA,
+          Brier_Score = NA,
+          Log_Loss = NA
+        ))
+      }
+
+      # Keep probabilities away from exactly 0/1
+      eps <- 1e-15
+      prob <- pmin(pmax(prob, eps), 1 - eps)
+
+      # AUC ROC
+      auc_value <- tryCatch(
+        as.numeric(
+          pROC::auc(
+            response = y,
+            predictor = prob,
+            direction = "<"
+          )
+        ),
+        error = function(e) NA_real_
+      )
+
+      # Brier Score
+      brier_score <- mean((prob - y)^2)
+
+      # Log Loss
+      log_loss <- -mean(
+        y * log(prob) + (1 - y) * log(1 - prob)
+      )
+
+      return(list(
+        AUC_ROC = auc_value,
+        Brier_Score = brier_score,
+        Log_Loss = log_loss
+      ))
+
+    }, error = function(e) {
+
+      return(list(
+        AUC_ROC = NA,
+        Brier_Score = NA,
+        Log_Loss = NA
+      ))
+    })
+  }
+
+  # ----------------------------------------------------------
+  # Calcolo metriche TRAIN e TEST
+  # ----------------------------------------------------------
+  train_metrics <- compute_metrics(best_expr, lm_data)
+  test_metrics  <- compute_metrics(best_expr, test_data)
+
+  return(list(
+    Seed = paste0("Seed N:", i),
+
+    Train_AUC_ROC = train_metrics$AUC_ROC,
+    Train_Brier_Score = train_metrics$Brier_Score,
+    Train_Log_Loss = train_metrics$Log_Loss,
+
+    Test_AUC_ROC = test_metrics$AUC_ROC,
+    Test_Brier_Score = test_metrics$Brier_Score,
+    Test_Log_Loss = test_metrics$Log_Loss,
+
+    Best_expression = best_expr
+  ))
+}
+
+# ------------------------------------------------------------
+# 4. Esporta funzione e variabili ai worker
+# ------------------------------------------------------------
+clusterExport(
+  cl,
+  varlist = c(
+    "run_single_seed",
+    "lm_data",
+    "test_data",
+    "marker_names"
+  )
+)
+
+# ------------------------------------------------------------
+# 5. Esegui in parallelo con barra di avanzamento
+# ------------------------------------------------------------
+seeds_to_run <- 501:1000
+
+print("Starting parallel runs with progress bar...")
+
+results_list <- pblapply(
+  seeds_to_run,
+  function(i) {
+    run_single_seed(
+      i,
+      lm_data,
+      test_data,
+      marker_names
+    )
+  },
+  cl = cl
+)
+
+print("All parallel runs completed.")
+
+# ------------------------------------------------------------
+# 6. Salva risultati
+# ------------------------------------------------------------
+results_table <- rbindlist(results_list, fill = TRUE)
+
+print("Saving results...")
+
+fwrite(
+  results_table,
+  "symbolic_results_summary_binary_501_1000.csv"
+)
+
+print("Results saved successfully.")
+
+# ------------------------------------------------------------
+# 7. Chiudi cluster
+# ------------------------------------------------------------
+stopCluster(cl)
+
+print("Cluster stopped. All done.")
