@@ -282,7 +282,7 @@ safe_predict <- function(model, data) {
 }
 
 # Revised parameter search with safe functions
-best_test_r2 <- -Inf
+best_cv_error <- Inf          # cross-validated error (lower is better)
 best_params <- NULL
 best_model <- NULL
 results_grid <- data.frame()
@@ -299,13 +299,23 @@ for(cp_val in seq(0.00001, 0.1, length.out = 10)) {
             data = lm_data,
             method = "anova",
             control = rpart.control(
-              minsplit = mins, # how many samples in a node after each split to keep going
+              minsplit = mins,
               minbucket = minb,
-              cp = cp_val, # how much it has to improve after each split to keep going
+              cp = cp_val,
               maxdepth = maxd,
               xval = 5
             )
           )
+          
+          # >>> CHANGE 1: add this block right here <<<
+          cv_error <- tryCatch({
+            cpt <- dt_model$cptable
+            if (is.null(cpt) || nrow(cpt) == 0) {
+              Inf
+            } else {
+              min(cpt[, "xerror"], na.rm = TRUE)
+            }
+          }, error = function(e) Inf)
           
           # Predict with safety
           train_pred <- safe_predict(dt_model, lm_data)
@@ -329,6 +339,7 @@ for(cp_val in seq(0.00001, 0.1, length.out = 10)) {
             maxdepth = maxd,
             minsplit = mins,
             minbucket = minb,
+            cv_error = cv_error,       # >>> CHANGE 2: new column <<<
             train_r2 = train_r2,
             test_r2 = test_r2,
             train_mae = train_mae,
@@ -339,14 +350,15 @@ for(cp_val in seq(0.00001, 0.1, length.out = 10)) {
           ))
           
           # Update best model (still based on R², but could be changed to MAE)
-          if(!is.na(test_r2) && test_r2 > best_test_r2) {
-            best_test_r2 <- test_r2
+          if(!is.na(cv_error) && cv_error < best_cv_error) {
+            best_cv_error <- cv_error
             best_params <- list(cp = cp_val, maxdepth = maxd, 
                                 minsplit = mins, minbucket = minb)
             best_model <- dt_model
             
             cat(sprintf("New best: cp=%.6f, depth=%d, minsplit=%d, minbucket=%d\n",
                         cp_val, maxd, mins, minb))
+            cat(sprintf("  CV error=%.4f  (lower is better)\n", cv_error))
             cat(sprintf("  Train R2=%.4f, Test R2=%.4f\n",
                         train_r2, test_r2))
             cat(sprintf("  Train MAE=%.4f, Test MAE=%.4f\n",
@@ -362,6 +374,100 @@ for(cp_val in seq(0.00001, 0.1, length.out = 10)) {
       }
     }
   }
+}
+
+# ------------------------------------------------------------
+# 3.5 Distribution analysis of all grid-search runs
+# ------------------------------------------------------------
+cat("\n================== DISTRIBUTION ANALYSIS ==================\n")
+
+if (nrow(results_grid) > 0) {
+  
+  # ---- 1. Build long-format data (base R, no extra deps) ----
+  metrics_to_plot <- c("train_r2", "test_r2",
+                       "train_rmse", "test_rmse",
+                       "train_mae",  "test_mae")
+  
+  results_long <- data.frame(
+    Metric = factor(rep(metrics_to_plot, each = nrow(results_grid)),
+                    levels = metrics_to_plot,
+                    labels = c("Train R²", "Test R²",
+                               "Train RMSE", "Test RMSE",
+                               "Train MAE",  "Test MAE")),
+    Value  = unlist(results_grid[, metrics_to_plot], use.names = FALSE)
+  )
+  
+  # ---- 2. Build the distribution plot ----
+  p <- ggplot(results_long, aes(x = Metric, y = Value, fill = Metric)) +
+    geom_violin(alpha = 0.55, trim = FALSE, colour = NA) +
+    geom_boxplot(width = 0.18, alpha = 0.85, outlier.size = 0.8,
+                 colour = "grey20") +
+    stat_summary(fun = mean, geom = "point", shape = 23,
+                 size = 2.6, fill = "white", colour = "black") +
+    facet_wrap(~ Metric, scales = "free", ncol = 3) +
+    theme_bw() +
+    labs(
+      title    = "Distribution of Metrics Across All Grid-Search Runs",
+      subtitle = "White diamond = mean | Boxplot = median & quartiles | Violin = density",
+      x = NULL, y = "Value"
+    ) +
+    theme(
+      legend.position = "none",
+      plot.title      = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle   = element_text(hjust = 0.5),
+      strip.text      = element_text(face = "bold")
+    )
+  
+  ggsave("distribution_tree_graph.png", plot = p,
+         width = 12, height = 8, dpi = 300)
+  cat("Distribution graph saved to 'distribution_tree_graph.png'\n")
+  
+  # ---- 3. Summary statistics (mean / median / sd / min / max) ----
+  summary_stats <- data.frame(
+    Metric = metrics_to_plot,
+    Mean   = sapply(results_grid[, metrics_to_plot], mean,   na.rm = TRUE),
+    Median = sapply(results_grid[, metrics_to_plot], median, na.rm = TRUE),
+    SD     = sapply(results_grid[, metrics_to_plot], sd,     na.rm = TRUE),
+    Min    = sapply(results_grid[, metrics_to_plot], min,    na.rm = TRUE),
+    Max    = sapply(results_grid[, metrics_to_plot], max,    na.rm = TRUE)
+  )
+  rownames(summary_stats) <- NULL
+  
+  cat("\nSummary statistics across all runs:\n")
+  print(summary_stats)
+  
+  write.table(summary_stats, file = "distribution_summary_stats.txt",
+              sep = "\t", row.names = FALSE, quote = FALSE)
+  cat("\nSummary statistics saved to 'distribution_summary_stats.txt'\n")
+  
+  # ---- 4. A table in the same shape as 'decision_tree_metrics.txt'
+  #         but with mean / median of the distribution instead of the best run ----
+  distribution_metrics <- data.frame(
+    Metric          = c("R²", "RMSE", "MAE"),
+    Training_Mean   = c(mean(results_grid$train_r2,   na.rm = TRUE),
+                        mean(results_grid$train_rmse, na.rm = TRUE),
+                        mean(results_grid$train_mae,  na.rm = TRUE)),
+    Training_Median = c(median(results_grid$train_r2,   na.rm = TRUE),
+                        median(results_grid$train_rmse, na.rm = TRUE),
+                        median(results_grid$train_mae,  na.rm = TRUE)),
+    Testing_Mean    = c(mean(results_grid$test_r2,   na.rm = TRUE),
+                        mean(results_grid$test_rmse, na.rm = TRUE),
+                        mean(results_grid$test_mae,  na.rm = TRUE)),
+    Testing_Median  = c(median(results_grid$test_r2,   na.rm = TRUE),
+                        median(results_grid$test_rmse, na.rm = TRUE),
+                        median(results_grid$test_mae,  na.rm = TRUE))
+  )
+  
+  cat("\nMean / median metrics across the distribution:\n")
+  print(distribution_metrics)
+  
+  write.table(distribution_metrics,
+              file = "distribution_metrics.txt",
+              sep = "\t", row.names = FALSE, quote = FALSE)
+  cat("Mean/median metrics saved to 'distribution_metrics.txt'\n")
+  
+} else {
+  cat("results_grid is empty — nothing to plot.\n")
 }
 
 # ------------------------------------------------------------
@@ -3208,11 +3314,84 @@ write.table(best_summary,
 
 cat("\nResults saved to:\n")
 
+library(ggplot2)
+
+# Read the results table
+results_table <- read.delim(
+  "symbolic_regression_parallel_results.txt",
+  stringsAsFactors = FALSE
+)
+
+# Which metrics to plot
+metrics_to_plot <- c(
+  "Train_R_squared", "Test_R_squared",
+  "Train_RMSE",      "Test_RMSE",
+  "Train_MAE",       "Test_MAE"
+)
+
+# Long format for ggplot
+results_long <- data.frame(
+  Metric = factor(
+    rep(metrics_to_plot, each = nrow(results_table)),
+    levels = metrics_to_plot,
+    labels = c("Train R²", "Test R²",
+               "Train RMSE", "Test RMSE",
+               "Train MAE",  "Test MAE")
+  ),
+  Value = unlist(results_table[, metrics_to_plot], use.names = FALSE)
+)
+
+# Violin + boxplot + mean diamond
+p <- ggplot(results_long, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_violin(alpha = 0.55, trim = FALSE, colour = NA) +
+  geom_boxplot(width = 0.18, alpha = 0.85, outlier.size = 0.8,
+               colour = "grey20") +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 2.6, fill = "white", colour = "black") +
+  facet_wrap(~ Metric, scales = "free", ncol = 3) +
+  theme_bw() +
+  labs(
+    title    = "Distribution of Metrics Across All Symbolic-Regression Runs",
+    subtitle = "White diamond = mean | Boxplot = median & quartiles | Violin = density",
+    x = NULL, y = "Value"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle   = element_text(hjust = 0.5),
+    strip.text      = element_text(face = "bold")
+  )
+
+ggsave("symbolic_regression_distribution.png", plot = p,
+       width = 12, height = 8, dpi = 300)
+
+# Summary stats
+summary_stats <- data.frame(
+  Metric = metrics_to_plot,
+  Mean   = sapply(results_table[, metrics_to_plot], mean,   na.rm = TRUE),
+  Median = sapply(results_table[, metrics_to_plot], median, na.rm = TRUE),
+  SD     = sapply(results_table[, metrics_to_plot], sd,     na.rm = TRUE),
+  Q1     = sapply(results_table[, metrics_to_plot],
+                  quantile, probs = 0.25, na.rm = TRUE),
+  Q3     = sapply(results_table[, metrics_to_plot],
+                  quantile, probs = 0.75, na.rm = TRUE)
+)
+summary_stats$IQR <- summary_stats$Q3 - summary_stats$Q1
+
+write.csv(summary_stats,
+          "symbolic_regression_distribution_summary.csv",
+          row.names = FALSE)
+
+print(summary_stats, row.names = FALSE)
+
 
 # FINE PARTE FENOTIPO CONTINUO
 # INIZIO PARTE FENOTIPO BINARIO
 
-##Feature selection
+###
+##FEATURE SELECTION
+###
+
 setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\richiesta_dati_reali\\EGAD00000000003_decriptati\\effettivamente_utili")
 
 # 1. Load required libraries
@@ -3640,15 +3819,521 @@ cat("============================================\n")
 
 print(performance)
 
+##
+## SYMBOLIC REGRESSION
+##
 
+library(gramEvol)
+library(data.table)
+library(parallel)
+library(pbapply)
+library(pROC)
 
+# ------------------------------------------------------------
+# 1. Imposta numero di thread e cluster parallelo
+# ------------------------------------------------------------
+total_threads <- parallel::detectCores(logical = TRUE)
+num_cores <- total_threads - 1
+
+# One data.table thread per worker to avoid oversubscription
+setDTthreads(1)
+
+print(paste0(
+  "Available logical threads: ", total_threads,
+  " | Parallel workers: ", num_cores
+))
+
+print("Creating cluster...")
+cl <- makeCluster(num_cores)
+print("Cluster created successfully.")
+
+# ------------------------------------------------------------
+# 2. Carica dataset
+# ------------------------------------------------------------
+print("Loading datasets...")
+
+features_selected <- fread("selected_SNPs.txt", header = FALSE)
+marker_names <- features_selected$V1
+
+df_train_fs <- fread("train_selected_SNPs_header_fenotipo_corretto_in_phenotype_da_y.csv")
+df_test_fs  <- fread("test_selected_SNPs_header_fenotipo_corretto_in_phenotype_da_y.csv")
+
+# Remove any literal quote characters left in the column names
+names(df_train_fs) <- gsub('"', '', names(df_train_fs))
+names(df_test_fs)  <- gsub('"', '', names(df_test_fs))
+
+print("Datasets loaded successfully.")
+
+# Check phenotype
+if (!"phenotype" %in% names(df_train_fs)) {
+  stop("Column 'phenotype' not found in train_selected_SNPs.csv")
+}
+
+if (!"phenotype" %in% names(df_test_fs)) {
+  stop("Column 'phenotype' not found in test_selected_SNPs.csv")
+}
+
+# Keep only selected SNPs + phenotype
+missing_train <- setdiff(marker_names, names(df_train_fs))
+missing_test  <- setdiff(marker_names, names(df_test_fs))
+
+if (length(missing_train) > 0) {
+  stop("The following selected SNPs are missing from the training dataset: ",
+       paste(missing_train, collapse = ", "))
+}
+
+if (length(missing_test) > 0) {
+  stop("The following selected SNPs are missing from the test dataset: ",
+       paste(missing_test, collapse = ", "))
+}
+
+lm_data <- df_train_fs[, c(marker_names, "phenotype"), with = FALSE]
+test_data <- df_test_fs[, c(marker_names, "phenotype"), with = FALSE]
+
+# Make sure phenotype is binary numeric 0/1
+lm_data[, phenotype := as.numeric(phenotype)]
+test_data[, phenotype := as.numeric(phenotype)]
+
+if (!all(na.omit(lm_data$phenotype) %in% c(0, 1))) {
+  stop("Training phenotype must contain only 0/1 values.")
+}
+
+if (!all(na.omit(test_data$phenotype) %in% c(0, 1))) {
+  stop("Test phenotype must contain only 0/1 values.")
+}
+
+print(paste0("Training samples: ", nrow(lm_data)))
+print(paste0("Test samples: ", nrow(test_data)))
+print(paste0("Selected SNPs: ", length(marker_names)))
+
+# ------------------------------------------------------------
+# 3. Funzione principale per ogni seed
+# ------------------------------------------------------------
+run_single_seed <- function(i, lm_data, test_data, marker_names) {
+  
+  library(gramEvol)
+  library(data.table)
+  
+  print(paste0("Running seed ", i))
+  set.seed(i)
+  
+  # --- Funzioni sicure ---
+  safe_log <- function(x) ifelse(x <= 0, 0, log(x))
+  safe_sqrt <- function(x) ifelse(x < 0, 0, sqrt(x))
+  safe_div <- function(x, y) ifelse(y == 0, 0, x / y)
+  
+  # --- Crea grammatica ---
+  ruleDef <- list(
+    expr = gsrule(
+      "<expr><op><expr>",
+      "<func>(<expr>)",
+      "<var>",
+      "<const>"
+    ),
+    op = gsrule("+", "-", "*", "/"),
+    func = grule(sin, safe_log, exp, safe_sqrt),
+    var = do.call(grule, as.list(marker_names)),
+    const = grule(1, 2, 3)
+  )
+  
+  grammarDef <- CreateGrammar(ruleDef)
+  
+  # --- Funzione di valutazione ---
+  evalFunc <- function(expr) {
+    
+    tryCatch({
+      
+      for (m in marker_names) {
+        expr <- gsub(paste0('"', m, '"'), m, expr, fixed = TRUE)
+        expr <- gsub(paste0("'", m, "'"), m, expr, fixed = TRUE)
+      }
+      
+      e <- parse(text = expr)
+      score <- eval(e, envir = lm_data)
+      y <- lm_data$phenotype
+      
+      if (length(score) != length(y) ||
+          !is.numeric(score) ||
+          any(!is.finite(score))) {
+        return(1e10)
+      }
+      
+      # Convert symbolic-regression score to probability
+      prob <- plogis(score)
+      
+      if (any(!is.finite(prob))) {
+        return(1e10)
+      }
+      
+      # Log Loss
+      eps <- 1e-15
+      prob <- pmin(pmax(prob, eps), 1 - eps)
+      
+      logloss <- -mean(
+        y * log(prob) + (1 - y) * log(1 - prob)
+      )
+      
+      # Penalità per complessità
+      n_terms <- length(strsplit(expr, split = "\\+|-|\\*")[[1]])
+      n_ops <- length(gregexpr("\\+|-|\\*", expr)[[1]])
+      
+      if (n_ops < 0) n_ops <- 0
+      
+      lambda <- 3
+      cost <- logloss + lambda * (n_terms + n_ops)
+      
+      return(cost)
+      
+    }, error = function(e) {
+      return(1e10)
+    })
+  }
+  
+  # --- Esecuzione grammaticale ---
+  ge <- GrammaticalEvolution(
+    grammarDef,
+    evalFunc,
+    iterations = 1000,
+    popSize = 300,
+    newPerGen = 15,
+    elitism = 3,
+    mutationChance = 0.3,
+    optimizer = "ga"
+  )
+  
+  best_expr <- as.character(ge$best$expressions)
+  
+  # ----------------------------------------------------------
+  # Funzione per calcolare metriche
+  # ----------------------------------------------------------
+  compute_metrics <- function(expr, data) {
+    
+    tryCatch({
+      
+      y <- data$phenotype
+      
+      for (m in marker_names) {
+        expr <- gsub(paste0('"', m, '"'), m, expr, fixed = TRUE)
+        expr <- gsub(paste0("'", m, "'"), m, expr, fixed = TRUE)
+      }
+      
+      e <- parse(text = expr)
+      score <- eval(e, envir = data)
+      
+      if (length(score) != length(y) ||
+          !is.numeric(score) ||
+          any(!is.finite(score))) {
+        
+        return(list(
+          AUC_ROC = NA,
+          Brier_Score = NA,
+          Log_Loss = NA
+        ))
+      }
+      
+      # Convert symbolic score to probability
+      prob <- plogis(score)
+      
+      if (any(!is.finite(prob))) {
+        return(list(
+          AUC_ROC = NA,
+          Brier_Score = NA,
+          Log_Loss = NA
+        ))
+      }
+      
+      # Keep probabilities away from exactly 0/1
+      eps <- 1e-15
+      prob <- pmin(pmax(prob, eps), 1 - eps)
+      
+      # AUC ROC
+      auc_value <- tryCatch(
+        as.numeric(
+          pROC::auc(
+            response = y,
+            predictor = prob,
+            direction = "<"
+          )
+        ),
+        error = function(e) NA_real_
+      )
+      
+      # Brier Score
+      brier_score <- mean((prob - y)^2)
+      
+      # Log Loss
+      log_loss <- -mean(
+        y * log(prob) + (1 - y) * log(1 - prob)
+      )
+      
+      return(list(
+        AUC_ROC = auc_value,
+        Brier_Score = brier_score,
+        Log_Loss = log_loss
+      ))
+      
+    }, error = function(e) {
+      
+      return(list(
+        AUC_ROC = NA,
+        Brier_Score = NA,
+        Log_Loss = NA
+      ))
+    })
+  }
+  
+  # ----------------------------------------------------------
+  # Calcolo metriche TRAIN e TEST
+  # ----------------------------------------------------------
+  train_metrics <- compute_metrics(best_expr, lm_data)
+  test_metrics  <- compute_metrics(best_expr, test_data)
+  
+  return(list(
+    Seed = paste0("Seed N:", i),
+    
+    Train_AUC_ROC = train_metrics$AUC_ROC,
+    Train_Brier_Score = train_metrics$Brier_Score,
+    Train_Log_Loss = train_metrics$Log_Loss,
+    
+    Test_AUC_ROC = test_metrics$AUC_ROC,
+    Test_Brier_Score = test_metrics$Brier_Score,
+    Test_Log_Loss = test_metrics$Log_Loss,
+    
+    Best_expression = best_expr
+  ))
+}
+
+# ------------------------------------------------------------
+# 4. Esporta funzione e variabili ai worker
+# ------------------------------------------------------------
+clusterExport(
+  cl,
+  varlist = c(
+    "run_single_seed",
+    "lm_data",
+    "test_data",
+    "marker_names"
+  )
+)
+
+# ------------------------------------------------------------
+# 5. Esegui in parallelo con barra di avanzamento
+# ------------------------------------------------------------
+seeds_to_run <- 1000:1099
+
+print("Starting parallel runs with progress bar...")
+
+results_list <- pblapply(
+  seeds_to_run,
+  function(i) {
+    run_single_seed(
+      i,
+      lm_data,
+      test_data,
+      marker_names
+    )
+  },
+  cl = cl
+)
+
+print("All parallel runs completed.")
+
+# ------------------------------------------------------------
+# 6. Salva risultati
+# ------------------------------------------------------------
+results_table <- rbindlist(results_list, fill = TRUE)
+
+print("Saving results...")
+
+fwrite(
+  results_table,
+  "symbolic_results_summary_binary_1_100.csv"
+)
+
+print("Results saved successfully.")
+
+# ------------------------------------------------------------
+# 7. Chiudi cluster
+# ------------------------------------------------------------
+stopCluster(cl)
+
+print("Cluster stopped. All done.")
 
 # ====================================================================
-# DECISION TREE - BINARY PHENOTYPE
-# Same SNPs selected by LASSO
-# Metrics: AUC-ROC, Brier Score, Log Loss
-# Also extracts the classification rules used by the tree
+# SYMBOLIC REGRESSION (BINARY) - DISTRIBUTION VIOLIN PLOT
+# Option A: drop outliers with implausible metric values
 # ====================================================================
+
+setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\richiesta_dati_reali\\EGAD00000000003_decriptati\\effettivamente_utili")
+library(ggplot2)
+
+# ------------------------------------------------------------
+# 1. Load the results file and fix the shifted columns
+# ------------------------------------------------------------
+raw <- read.delim(
+  "symbolic_results_summary_binary_1_1000.txt",
+  stringsAsFactors = FALSE
+)
+
+results_table <- data.frame(
+  Seed              = raw[[2]],
+  Train_AUC_ROC     = as.numeric(raw[[3]]),
+  Train_Brier_Score = as.numeric(raw[[4]]),
+  Train_Log_Loss    = as.numeric(raw[[5]]),
+  Test_AUC_ROC      = as.numeric(raw[[6]]),
+  Test_Brier_Score  = as.numeric(raw[[7]]),
+  Test_Log_Loss     = as.numeric(raw[[8]]),
+  Best_expression   = raw[[9]],
+  stringsAsFactors  = FALSE
+)
+
+# Drop rows where the key numeric metrics are NA
+results_table <- results_table[
+  !is.na(results_table$Train_AUC_ROC) &
+    !is.na(results_table$Test_AUC_ROC),
+]
+
+# Drop runs where grammatical evolution failed to produce a
+# meaningful expression (empty or containing no SNP term).
+valid_expr <- !is.na(results_table$Best_expression) &
+  nchar(results_table$Best_expression) > 0 &
+  grepl("SNP_", results_table$Best_expression)
+
+cat("Rows with valid expressions:", sum(valid_expr), "of", nrow(results_table), "\n")
+results_table <- results_table[valid_expr, ]
+
+# ------------------------------------------------------------
+# 2. Option A - keep only domain-plausible runs
+# ------------------------------------------------------------
+# A valid binary classifier must satisfy:
+#   0.5 <= AUC <= 1
+#   0.1 <= Brier <= 0.4
+#   0.3 <= LogLoss <= 1.0
+# Everything outside these ranges comes from degenerate symbolic
+# expressions and is dropped before plotting.
+
+metrics_to_plot <- c(
+  "Train_AUC_ROC", "Test_AUC_ROC",
+  "Train_Brier_Score", "Test_Brier_Score",
+  "Train_Log_Loss", "Test_Log_Loss"
+)
+
+meaningful <- apply(results_table[, metrics_to_plot], 1, function(x) {
+  all(!is.na(x)) &&
+    x["Train_AUC_ROC"]     >= 0.5 && x["Train_AUC_ROC"]     <= 1.0 &&
+    x["Test_AUC_ROC"]      >= 0.5 && x["Test_AUC_ROC"]      <= 1.0 &&
+    x["Train_Brier_Score"] >= 0.1 && x["Train_Brier_Score"] <= 0.4 &&
+    x["Test_Brier_Score"]  >= 0.1 && x["Test_Brier_Score"]  <= 0.4 &&
+    x["Train_Log_Loss"]    >= 0.3 && x["Train_Log_Loss"]    <= 1.0 &&
+    x["Test_Log_Loss"]     >= 0.3 && x["Test_Log_Loss"]     <= 1.0
+})
+
+cat("Rows before cleaning:", nrow(results_table), "\n")
+results_table <- results_table[meaningful, ]
+cat("Rows after cleaning: ", nrow(results_table), "\n")
+
+# ------------------------------------------------------------
+# 3. Sanity check
+# ------------------------------------------------------------
+cat("\nStructure of results_table:\n")
+str(results_table)
+
+cat("\nSummary of the six metrics (after cleaning):\n")
+print(summary(results_table[, metrics_to_plot]))
+
+# ------------------------------------------------------------
+# 4. Reshape into (Family, Split) long format
+# ------------------------------------------------------------
+family_map <- c(
+  Train_AUC_ROC      = "AUC",
+  Test_AUC_ROC       = "AUC",
+  Train_Brier_Score  = "Brier",
+  Test_Brier_Score   = "Brier",
+  Train_Log_Loss     = "LogLoss",
+  Test_Log_Loss      = "LogLoss"
+)
+
+split_map <- c(
+  Train_AUC_ROC      = "Train",
+  Test_AUC_ROC       = "Test",
+  Train_Brier_Score  = "Train",
+  Test_Brier_Score   = "Test",
+  Train_Log_Loss     = "Train",
+  Test_Log_Loss      = "Test"
+)
+
+long <- do.call(rbind, lapply(metrics_to_plot, function(m) {
+  data.frame(
+    Family = family_map[[m]],
+    Split  = split_map[[m]],
+    Value  = results_table[[m]]
+  )
+}))
+
+long$Family <- factor(long$Family, levels = c("AUC", "Brier", "LogLoss"))
+long$Split  <- factor(long$Split,  levels = c("Train", "Test"))
+
+# ------------------------------------------------------------
+# 5. Build the violin plot
+# ------------------------------------------------------------
+p <- ggplot(long, aes(x = Split, y = Value, fill = Split)) +
+  geom_violin(alpha = 0.55, trim = FALSE, colour = NA) +
+  geom_boxplot(width = 0.15, alpha = 0.85, outlier.size = 0.8,
+               colour = "grey20") +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 2.6, fill = "white", colour = "black") +
+  facet_wrap(~ Family, scales = "free_y", ncol = 3) +
+  theme_bw() +
+  labs(
+    title    = "Distribution of Metrics - Train vs Test",
+    subtitle = "White diamond = mean | Boxplot = median & quartiles | Violin = density",
+    x = NULL, y = "Value"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle   = element_text(hjust = 0.5),
+    strip.text      = element_text(face = "bold")
+  )
+
+ggsave(
+  "symbolic_regression_binary_distribution.png",
+  plot = p,
+  width = 11, height = 5, dpi = 300
+)
+
+cat("\nPlot saved to 'symbolic_regression_binary_distribution.png'\n")
+
+# ------------------------------------------------------------
+# 6. Summary statistics table
+# ------------------------------------------------------------
+summary_stats <- data.frame(
+  Metric = metrics_to_plot,
+  Mean   = sapply(results_table[, metrics_to_plot], mean,   na.rm = TRUE),
+  Median = sapply(results_table[, metrics_to_plot], median, na.rm = TRUE),
+  SD     = sapply(results_table[, metrics_to_plot], sd,     na.rm = TRUE),
+  Q1     = sapply(results_table[, metrics_to_plot],
+                  quantile, probs = 0.25, na.rm = TRUE),
+  Q3     = sapply(results_table[, metrics_to_plot],
+                  quantile, probs = 0.75, na.rm = TRUE)
+)
+summary_stats$IQR <- summary_stats$Q3 - summary_stats$Q1
+
+cat("\nSummary statistics (after cleaning):\n")
+print(summary_stats, row.names = FALSE)
+
+write.csv(
+  summary_stats,
+  "symbolic_regression_binary_distribution_summary.csv",
+  row.names = FALSE
+)
+
+cat("\nSummary saved to 'symbolic_regression_binary_distribution_summary.csv'\n")
+
+##
+## DECISION TREE - BINARY PHENOTYPE
+##
+
 
 setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\richiesta_dati_reali\\EGAD00000000003_decriptati\\effettivamente_utili")
 
@@ -3661,6 +4346,7 @@ library(data.table)
 library(rpart)
 library(rpart.plot)
 library(pROC)
+library(ggplot2)
 
 
 # ====================================================================
@@ -3677,12 +4363,12 @@ features_selected <- read.delim(
 features_selected <- features_selected$V1
 
 df_train_fs <- read.csv(
-  "train_selected_SNPs.csv",
+  "train_selected_SNPs_no_double_quotes.csv",
   stringsAsFactors = FALSE
 )
 
 df_test_fs <- read.csv(
-  "test_selected_SNPs.csv",
+  "test_selected_SNPs_no_double_quotes.csv",
   stringsAsFactors = FALSE
 )
 
@@ -4042,6 +4728,82 @@ for (cp_val in cp_values) {
         # Store results
         # ------------------------------------------------------------
         
+        # ------------------------------------------------------------
+        # Fit the tree on the FULL training set for these parameters
+        # and compute train/test metrics so we can build distributions
+        # afterwards. NOTE: test metrics are recorded ONLY for
+        # diagnostics; model selection still uses CV_AUC only.
+        # ------------------------------------------------------------
+        
+        model_full <- tryCatch(
+          
+          rpart(
+            y_factor ~ .,
+            data = tree_train,
+            method = "class",
+            control = rpart.control(
+              cp = cp_val,
+              maxdepth = maxd,
+              minsplit = mins,
+              minbucket = minb,
+              xval = 0
+            )
+          ),
+          
+          error = function(e) NULL
+          
+        )
+        
+        if (!is.null(model_full)) {
+          
+          p_tr <- tryCatch(
+            predict(model_full, newdata = tree_train, type = "prob")[, "Case"],
+            error = function(e) NULL
+          )
+          
+          p_te <- tryCatch(
+            predict(model_full, newdata = tree_test, type = "prob")[, "Case"],
+            error = function(e) NULL
+          )
+          
+          if (!is.null(p_tr) && !is.null(p_te)) {
+            
+            roc_tr <- tryCatch(
+              roc(response = tree_train$y_factor, predictor = p_tr,
+                  levels = c("Control", "Case"),
+                  direction = "<", quiet = TRUE),
+              error = function(e) NULL
+            )
+            
+            roc_te <- tryCatch(
+              roc(response = tree_test$y_factor, predictor = p_te,
+                  levels = c("Control", "Case"),
+                  direction = "<", quiet = TRUE),
+              error = function(e) NULL
+            )
+            
+            auc_tr     <- if (!is.null(roc_tr)) as.numeric(auc(roc_tr)) else NA
+            auc_te     <- if (!is.null(roc_te)) as.numeric(auc(roc_te)) else NA
+            brier_tr   <- brier_score(df_train_fs$y, p_tr)
+            brier_te   <- brier_score(df_test_fs$y,  p_te)
+            logloss_tr <- log_loss(df_train_fs$y, p_tr)
+            logloss_te <- log_loss(df_test_fs$y,  p_te)
+            
+          } else {
+            auc_tr <- auc_te <- brier_tr <- brier_te <-
+              logloss_tr <- logloss_te <- NA
+          }
+          
+        } else {
+          auc_tr <- auc_te <- brier_tr <- brier_te <-
+            logloss_tr <- logloss_te <- NA
+        }
+        
+        
+        # ------------------------------------------------------------
+        # Store results
+        # ------------------------------------------------------------
+        
         results_grid <- rbind(
           
           results_grid,
@@ -4051,7 +4813,13 @@ for (cp_val in cp_values) {
             maxdepth = maxd,
             minsplit = mins,
             minbucket = minb,
-            CV_AUC = mean_cv_auc
+            CV_AUC = mean_cv_auc,
+            Train_AUC        = auc_tr,       # <-- new
+            Test_AUC         = auc_te,       # <-- new
+            Train_Brier      = brier_tr,     # <-- new
+            Test_Brier       = brier_te,     # <-- new
+            Train_LogLoss    = logloss_tr,   # <-- new
+            Test_LogLoss     = logloss_te    # <-- new
           )
           
         )
@@ -4093,6 +4861,87 @@ cat("============================================\n")
 
 print(best_params)
 
+# ====================================================================
+# 9b. DISTRIBUTION OF METRICS ACROSS ALL GRID-SEARCH RUNS
+# ====================================================================
+
+cat("\n============================================\n")
+cat("DISTRIBUTION OF METRICS ACROSS RUNS\n")
+cat("============================================\n")
+
+# ---- 1. Long-format data for plotting ------------------------------
+
+metrics_to_plot <- c(
+  "Train_AUC", "Test_AUC",
+  "Train_Brier", "Test_Brier",
+  "Train_LogLoss", "Test_LogLoss"
+)
+
+results_long <- data.frame(
+  Metric = factor(
+    rep(metrics_to_plot, each = nrow(results_grid)),
+    levels = metrics_to_plot,
+    labels = c("Train AUC", "Test AUC",
+               "Train Brier", "Test Brier",
+               "Train Log Loss", "Test Log Loss")
+  ),
+  Value = unlist(results_grid[, metrics_to_plot], use.names = FALSE)
+)
+
+# ---- 2. Violin + boxplot + mean diamond ----------------------------
+
+p <- ggplot(results_long, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_violin(alpha = 0.55, trim = FALSE, colour = NA) +
+  geom_boxplot(width = 0.18, alpha = 0.85, outlier.size = 0.8,
+               colour = "grey20") +
+  stat_summary(fun = mean, geom = "point", shape = 23,
+               size = 2.6, fill = "white", colour = "black") +
+  facet_wrap(~ Metric, scales = "free", ncol = 3) +
+  theme_bw() +
+  labs(
+    title    = "Distribution of Metrics Across All Grid-Search Runs",
+    subtitle = "White diamond = mean | Boxplot = median & quartiles | Violin = density",
+    x = NULL, y = "Value"
+  ) +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle   = element_text(hjust = 0.5),
+    strip.text      = element_text(face = "bold")
+  )
+
+ggsave(
+  "decision_tree_distribution.png",
+  plot = p,
+  width = 12, height = 8, dpi = 300
+)
+
+cat("Distribution plot saved to 'decision_tree_distribution.png'\n")
+
+# ---- 3. Summary statistics -----------------------------------------
+
+summary_stats <- data.frame(
+  Metric = metrics_to_plot,
+  Mean   = sapply(results_grid[, metrics_to_plot], mean,   na.rm = TRUE),
+  Median = sapply(results_grid[, metrics_to_plot], median, na.rm = TRUE),
+  SD     = sapply(results_grid[, metrics_to_plot], sd,     na.rm = TRUE),
+  Q1     = sapply(results_grid[, metrics_to_plot],
+                  quantile, probs = 0.25, na.rm = TRUE),
+  Q3     = sapply(results_grid[, metrics_to_plot],
+                  quantile, probs = 0.75, na.rm = TRUE)
+)
+
+summary_stats$IQR <- summary_stats$Q3 - summary_stats$Q1
+
+print(summary_stats, row.names = FALSE)
+
+write.csv(
+  summary_stats,
+  "decision_tree_distribution_summary.csv",
+  row.names = FALSE
+)
+
+cat("Distribution summary saved to 'decision_tree_distribution_summary.csv'\n")
 
 # ====================================================================
 # 10. FIT FINAL TREE ON ALL TRAINING DATA
@@ -4666,6 +5515,7 @@ cat("9. best_decision_tree_model.rds\n")
 
 
 cat("\nDecision tree analysis completed successfully.\n")
+
 
 ##
 ## PARTE RELATIVA A SVM BINARIO 
@@ -7591,337 +8441,12 @@ stopCluster(
 
 registerDoSEQ()
 
-##
-## SYMBOLIC REGRESSION (fenotipo binario)
-##
-library(gramEvol)
-library(data.table)
-library(parallel)
-library(pbapply)
-library(pROC)
 
-# ------------------------------------------------------------
-# 1. Imposta numero di thread e cluster parallelo
-# ------------------------------------------------------------
-total_threads <- parallel::detectCores(logical = TRUE)
-num_cores <- max(1, total_threads - 1)
 
-# One data.table thread per worker to avoid oversubscription
-setDTthreads(1)
 
-print(paste0(
-  "Available logical threads: ", total_threads,
-  " | Parallel workers: ", num_cores
-))
-
-print("Creating cluster...")
-cl <- makeCluster(num_cores)
-print("Cluster created successfully.")
-
-# ------------------------------------------------------------
-# 2. Carica dataset
-# ------------------------------------------------------------
-print("Loading datasets...")
-
-features_selected <- fread("selected_SNPs.txt", header = FALSE)
-marker_names <- features_selected$V1
-
-df_train_fs <- fread("train_selected_SNPs.csv")
-df_test_fs  <- fread("test_selected_SNPs.csv")
-
-print("Datasets loaded successfully.")
-
-# Check phenotype
-if (!"phenotype" %in% names(df_train_fs)) {
-  stop("Column 'phenotype' not found in train_selected_SNPs.csv")
-}
-
-if (!"phenotype" %in% names(df_test_fs)) {
-  stop("Column 'phenotype' not found in test_selected_SNPs.csv")
-}
-
-# Keep only selected SNPs + phenotype
-missing_train <- setdiff(marker_names, names(df_train_fs))
-missing_test  <- setdiff(marker_names, names(df_test_fs))
-
-if (length(missing_train) > 0) {
-  stop("The following selected SNPs are missing from the training dataset: ",
-       paste(missing_train, collapse = ", "))
-}
-
-if (length(missing_test) > 0) {
-  stop("The following selected SNPs are missing from the test dataset: ",
-       paste(missing_test, collapse = ", "))
-}
-
-lm_data <- df_train_fs[, c(marker_names, "phenotype"), with = FALSE]
-test_data <- df_test_fs[, c(marker_names, "phenotype"), with = FALSE]
-
-# Make sure phenotype is binary numeric 0/1
-lm_data[, phenotype := as.numeric(phenotype)]
-test_data[, phenotype := as.numeric(phenotype)]
-
-if (!all(na.omit(lm_data$phenotype) %in% c(0, 1))) {
-  stop("Training phenotype must contain only 0/1 values.")
-}
-
-if (!all(na.omit(test_data$phenotype) %in% c(0, 1))) {
-  stop("Test phenotype must contain only 0/1 values.")
-}
-
-print(paste0("Training samples: ", nrow(lm_data)))
-print(paste0("Test samples: ", nrow(test_data)))
-print(paste0("Selected SNPs: ", length(marker_names)))
-
-# ------------------------------------------------------------
-# 3. Funzione principale per ogni seed
-# ------------------------------------------------------------
-run_single_seed <- function(i, lm_data, test_data, marker_names) {
-
-  library(gramEvol)
-  library(data.table)
-
-  print(paste0("Running seed ", i))
-  set.seed(i)
-
-  # --- Funzioni sicure ---
-  safe_log <- function(x) ifelse(x <= 0, 0, log(x))
-  safe_sqrt <- function(x) ifelse(x < 0, 0, sqrt(x))
-  safe_div <- function(x, y) ifelse(y == 0, 0, x / y)
-
-  # --- Crea grammatica ---
-  ruleDef <- list(
-    expr = gsrule(
-      "<expr><op><expr>",
-      "<func>(<expr>)",
-      "<var>",
-      "<const>"
-    ),
-    op = gsrule("+", "-", "*", "/"),
-    func = grule(sin, safe_log, exp, safe_sqrt),
-    var = do.call(grule, as.list(marker_names)),
-    const = grule(1, 2, 3)
-  )
-
-  grammarDef <- CreateGrammar(ruleDef)
-
-  # --- Funzione di valutazione ---
-  evalFunc <- function(expr) {
-
-    tryCatch({
-
-      for (m in marker_names) {
-        expr <- gsub(paste0('"', m, '"'), m, expr, fixed = TRUE)
-        expr <- gsub(paste0("'", m, "'"), m, expr, fixed = TRUE)
-      }
-
-      e <- parse(text = expr)
-      score <- eval(e, envir = lm_data)
-      y <- lm_data$phenotype
-
-      if (length(score) != length(y) ||
-          !is.numeric(score) ||
-          any(!is.finite(score))) {
-        return(1e10)
-      }
-
-      # Convert symbolic-regression score to probability
-      prob <- plogis(score)
-
-      if (any(!is.finite(prob))) {
-        return(1e10)
-      }
-
-      # Log Loss
-      eps <- 1e-15
-      prob <- pmin(pmax(prob, eps), 1 - eps)
-
-      logloss <- -mean(
-        y * log(prob) + (1 - y) * log(1 - prob)
-      )
-
-      # Penalità per complessità
-      n_terms <- length(strsplit(expr, split = "\\+|-|\\*")[[1]])
-      n_ops <- length(gregexpr("\\+|-|\\*", expr)[[1]])
-
-      if (n_ops < 0) n_ops <- 0
-
-      lambda <- 3
-      cost <- logloss + lambda * (n_terms + n_ops)
-
-      return(cost)
-
-    }, error = function(e) {
-      return(1e10)
-    })
-  }
-
-  # --- Esecuzione grammaticale ---
-  ge <- GrammaticalEvolution(
-    grammarDef,
-    evalFunc,
-    iterations = 1000,
-    popSize = 300,
-    newPerGen = 15,
-    elitism = 3,
-    mutationChance = 0.3,
-    optimizer = "ga"
-  )
-
-  best_expr <- as.character(ge$best$expressions)
-
-  # ----------------------------------------------------------
-  # Funzione per calcolare metriche
-  # ----------------------------------------------------------
-  compute_metrics <- function(expr, data) {
-
-    tryCatch({
-
-      y <- data$phenotype
-
-      for (m in marker_names) {
-        expr <- gsub(paste0('"', m, '"'), m, expr, fixed = TRUE)
-        expr <- gsub(paste0("'", m, "'"), m, expr, fixed = TRUE)
-      }
-
-      e <- parse(text = expr)
-      score <- eval(e, envir = data)
-
-      if (length(score) != length(y) ||
-          !is.numeric(score) ||
-          any(!is.finite(score))) {
-
-        return(list(
-          AUC_ROC = NA,
-          Brier_Score = NA,
-          Log_Loss = NA
-        ))
-      }
-
-      # Convert symbolic score to probability
-      prob <- plogis(score)
-
-      if (any(!is.finite(prob))) {
-        return(list(
-          AUC_ROC = NA,
-          Brier_Score = NA,
-          Log_Loss = NA
-        ))
-      }
-
-      # Keep probabilities away from exactly 0/1
-      eps <- 1e-15
-      prob <- pmin(pmax(prob, eps), 1 - eps)
-
-      # AUC ROC
-      auc_value <- tryCatch(
-        as.numeric(
-          pROC::auc(
-            response = y,
-            predictor = prob,
-            direction = "<"
-          )
-        ),
-        error = function(e) NA_real_
-      )
-
-      # Brier Score
-      brier_score <- mean((prob - y)^2)
-
-      # Log Loss
-      log_loss <- -mean(
-        y * log(prob) + (1 - y) * log(1 - prob)
-      )
-
-      return(list(
-        AUC_ROC = auc_value,
-        Brier_Score = brier_score,
-        Log_Loss = log_loss
-      ))
-
-    }, error = function(e) {
-
-      return(list(
-        AUC_ROC = NA,
-        Brier_Score = NA,
-        Log_Loss = NA
-      ))
-    })
-  }
-
-  # ----------------------------------------------------------
-  # Calcolo metriche TRAIN e TEST
-  # ----------------------------------------------------------
-  train_metrics <- compute_metrics(best_expr, lm_data)
-  test_metrics  <- compute_metrics(best_expr, test_data)
-
-  return(list(
-    Seed = paste0("Seed N:", i),
-
-    Train_AUC_ROC = train_metrics$AUC_ROC,
-    Train_Brier_Score = train_metrics$Brier_Score,
-    Train_Log_Loss = train_metrics$Log_Loss,
-
-    Test_AUC_ROC = test_metrics$AUC_ROC,
-    Test_Brier_Score = test_metrics$Brier_Score,
-    Test_Log_Loss = test_metrics$Log_Loss,
-
-    Best_expression = best_expr
-  ))
-}
-
-# ------------------------------------------------------------
-# 4. Esporta funzione e variabili ai worker
-# ------------------------------------------------------------
-clusterExport(
-  cl,
-  varlist = c(
-    "run_single_seed",
-    "lm_data",
-    "test_data",
-    "marker_names"
-  )
-)
-
-# ------------------------------------------------------------
-# 5. Esegui in parallelo con barra di avanzamento
-# ------------------------------------------------------------
-seeds_to_run <- 501:1000
-
-print("Starting parallel runs with progress bar...")
-
-results_list <- pblapply(
-  seeds_to_run,
-  function(i) {
-    run_single_seed(
-      i,
-      lm_data,
-      test_data,
-      marker_names
-    )
-  },
-  cl = cl
-)
-
-print("All parallel runs completed.")
-
-# ------------------------------------------------------------
-# 6. Salva risultati
-# ------------------------------------------------------------
-results_table <- rbindlist(results_list, fill = TRUE)
-
-print("Saving results...")
-
-fwrite(
-  results_table,
-  "symbolic_results_summary_binary_501_1000.csv"
-)
-
-print("Results saved successfully.")
-
-# ------------------------------------------------------------
-# 7. Chiudi cluster
-# ------------------------------------------------------------
-stopCluster(cl)
-
-print("Cluster stopped. All done.")
+#
+A <- read.csv("symbolic_results_summary_binary_1_100.csv")
+b <- read.csv("symbolic_results_summary_binary_101_500.csv")
+c <- read.csv("symbolic_results_summary_binary_501_1000.csv")
+unificati <- rbind(A,b,c)
+write.table(unificati, file = "symbolic_results_summary_binary_1_1000.txt", sep = "\t", quote = F)
