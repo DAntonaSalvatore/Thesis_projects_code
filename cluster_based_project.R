@@ -1,3 +1,5 @@
+# START OF SIMULATED DATA SECTION
+
 ##
 ## Linear regression with 10 significant SNPs
 ##
@@ -1771,3 +1773,7 @@ if (length(all_performance_data) > 0) {
   write.table(summary_stats, "performance_summary_statistics.txt",
               sep = "\t", row.names = FALSE, quote = FALSE)
 }
+               
+# END OF SIMULATED DATA SECTION
+# START OF HUMAN DATA SECTION
+               
