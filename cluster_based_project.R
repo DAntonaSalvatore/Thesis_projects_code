@@ -1,4 +1,520 @@
 ##
+## Linear regression with 10 significant SNPs
+##
+
+library(doParallel)
+library(foreach)
+library(data.table)
+library(dplyr)
+library(QRank)
+library(quantreg)
+library(dplyr)
+library(ggplot2)
+options(scipen = 999)
+setwd(getwd())
+#setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Quantile_Regression\\Nuovi_dati_tutorial_Laza\\prova_CR_funzionera\\temporaneo_eliminare")
+load("simulation.RData")
+
+# ============================================
+# ADDED: Rank-based Inverse Normal Transformation function
+# ============================================
+rank_INT <- function(x) {
+  # Perform rank-based inverse normal transformation
+  # x: numeric vector
+  n <- length(x)
+  # Rank with average ties
+  r <- rank(x, ties.method = "average")
+  # Convert to quantiles (Blom's approximation)
+  q <- (r - 0.375) / (n + 0.25)
+  # Inverse normal transform
+  transformed <- qnorm(q)
+  return(transformed)
+}
+
+Num_varianti <- 250 # in origine 250
+ult_iterazione = 100 # in origine 100
+n_causal_snps <- 10  # Number of causal SNPs to select
+
+# Initialize confusion matrix storage
+models <- c("hom", "cauchy", "locscale", "local", "dom")
+
+# Create a list to store all performance data across iterations
+all_performance_data <- list()
+
+# ADDED: Option to turn INT on/off
+USE_INT <- TRUE  # Set to FALSE to run without normalization
+
+for (j in 1:ult_iterazione) {
+  print(j)
+  # Reset confusion results for each j iteration
+  confusion_results <- lapply(models, function(m) {
+    list(TP = 0, FP = 0, FN = 0, TN = 0)
+  })
+  names(confusion_results) <- models
+
+  # Randomly select columns
+  random_cols <- sample(ncol(geno), Num_varianti)
+  print(paste("Iteration:", j))
+  geno_subset <- geno[1:10000, random_cols] # in origine 10000
+
+  # phenotype simulation function (modified for multiple causal SNPs)
+  simu <- function(gt_matrix, covar, model = "hom", beta = rep(0.1, ncol(gt_matrix)), beta.dom = rep(0.2, ncol(gt_matrix)), gamma.cov = 0.5, local.tau = 0.7) {
+    n.sample = nrow(gt_matrix)
+    base_effect <- gamma.cov * covar
+
+    # Calculate total genetic effect as sum of effects from all causal SNPs
+    genetic_effect <- rep(0, n.sample)
+    for (s in 1:ncol(gt_matrix)) {
+      genetic_effect <- genetic_effect + beta[s] * gt_matrix[, s]
+    }
+
+    if (model == "hom") {
+      y = base_effect + genetic_effect + rnorm(n.sample)
+    } else if (model == "cauchy") {
+      y = base_effect + genetic_effect + rcauchy(n.sample)
+    } else if (model == "locscale") {
+      u = seq(0, 1, length = 50)
+      betax = function(u, u0) pmax(0, 5 * (u - u0) / (1 - u0))
+      uu = runif(n.sample)
+      slopex = betax(uu, local.tau)
+      # Apply slope modifier to each causal SNP's effect
+      modified_genetic_effect <- rep(0, n.sample)
+      for (s in 1:ncol(gt_matrix)) {
+        modified_genetic_effect <- modified_genetic_effect + beta[s] * slopex * gt_matrix[, s]
+      }
+      y = base_effect + modified_genetic_effect + (1 + 0.5 * modified_genetic_effect) * rnorm(n.sample)
+    } else if (model == "local") {
+      # Step 1: baseline phenotype without genetic effect
+      y0 <- base_effect + rnorm(n.sample)
+
+      # Step 2: empirical quantiles of y0
+      q_low  <- quantile(y0, probs = 0.6)
+      q_high <- quantile(y0, probs = 0.7)
+
+      # Step 3: indicator of local region in the *outcome distribution*
+      slopex <- ifelse(y0 > q_low & y0 < q_high, 1, 0)
+
+      # Step 4: apply genetic effect ONLY in that region
+      modified_genetic_effect <- rep(0, n.sample)
+      for (s in 1:ncol(gt_matrix)) {
+        modified_genetic_effect <- modified_genetic_effect +
+          beta[s] * slopex * gt_matrix[, s]
+      }
+
+      # Step 5: final phenotype
+      y <- y0 + modified_genetic_effect
+
+    } else if (model == "dom") {
+      # Add dominance effects for each causal SNP
+      dominance_effect <- rep(0, n.sample)
+      for (s in 1:ncol(gt_matrix)) {
+        gt.dom = ifelse(gt_matrix[, s] == 1, 1, 0)
+        dominance_effect <- dominance_effect + beta.dom[s] * gt.dom
+      }
+      y = base_effect + genetic_effect + dominance_effect + rnorm(n.sample)
+    }
+    return(y)
+  }
+
+  # Generate covariate
+  COVAR1 <- sample(0:1, nrow(geno_subset), replace = TRUE)
+
+  cat(">> Replicate number:", j, "\n")
+
+  # beta erano 0.2
+  beta_values <- rep(0.15, n_causal_snps)
+  beta.dom_values <- rep(0.15, n_causal_snps)
+
+  # prima era local.tau = 0.7
+  local.tau = 0.85
+
+  n.seed = j
+  set.seed(seed = n.seed)
+
+  # Select 5 causal variants (without replacement)
+  idx.casual = sample(1:ncol(geno_subset), size = n_causal_snps, replace = FALSE)
+  gt_matrix = geno_subset[, idx.casual]
+  causal_ids <- colnames(geno_subset)[idx.casual]
+  cat("Causal SNPs:", paste(causal_ids, collapse = ", "), "\n")
+
+  # SPEED OPTIMIZATION: Generate all phenotypes at once
+  set.seed(n.seed)
+  phenotypes <- list(
+    y.hom = simu(gt_matrix = gt_matrix, covar = COVAR1, model = "hom", beta = beta_values, beta.dom = beta.dom_values),
+    y.cauchy = simu(gt_matrix = gt_matrix, covar = COVAR1, model = "cauchy", beta = beta_values, beta.dom = beta.dom_values),
+    y.locscale = simu(gt_matrix = gt_matrix, covar = COVAR1, model = "locscale", beta = beta_values, beta.dom = beta.dom_values, local.tau = local.tau),
+    y.local = simu(gt_matrix = gt_matrix, covar = COVAR1, model = "local", beta = beta_values, beta.dom = beta.dom_values, local.tau = local.tau),
+    y.dom = simu(gt_matrix = gt_matrix, covar = COVAR1, model = "dom", beta = beta_values, beta.dom = beta.dom_values)
+  )
+
+  # ============================================
+  # ADDED: Apply INT transformation if USE_INT is TRUE
+  # ============================================
+  if (USE_INT) {
+    cat("Applying rank-based inverse normal transformation (INT) to phenotypes\n")
+    phenotypes <- lapply(phenotypes, function(y) {
+      # Check for extreme values that might cause issues
+      if (any(is.infinite(y))) {
+        y[is.infinite(y)] <- sign(y[is.infinite(y)]) * max(abs(y[is.finite(y)]), na.rm = TRUE) * 10
+      }
+      return(rank_INT(y))
+    })
+  }
+
+  # Create IID
+  protoIID <- seq(1:nrow(geno_subset))
+  IID <- paste("HG", protoIID, sep = "")
+  geno_current <- cbind(IID, geno_subset)
+
+  # SPEED OPTIMIZATION: Create all phenotype data frames efficiently
+  create_pheno_df <- function(y_values, model_name) {
+    df <- data.frame(IID = IID, PHENOTYPE = y_values, COVAR1 = COVAR1)
+    colnames(df)[2] <- "PHENOTYPE"
+    return(df)
+  }
+
+  pheno_list <- list(
+    y.hom = create_pheno_df(phenotypes$y.hom, "y.hom"),
+    y.cauchy = create_pheno_df(phenotypes$y.cauchy, "y.cauchy"),
+    y.locscale = create_pheno_df(phenotypes$y.locscale, "y.locscale"),
+    y.local = create_pheno_df(phenotypes$y.local, "y.local"),
+    y.dom = create_pheno_df(phenotypes$y.dom, "y.dom")
+  )
+
+  modelli <- c("y.hom", "y.cauchy", "y.locscale", "y.local", "y.dom")
+
+  geno.mat <- geno_current[,-1]
+
+  # SPEED OPTIMIZATION: Set up parallel cluster once per iteration
+  ncores <- detectCores()
+  main_cluster <- makeCluster(ncores)
+  registerDoParallel(main_cluster)
+
+  # Linear regression function
+  linear_regression_test <- function(phe, cov, snp) {
+    # Create data frame for regression
+    df <- data.frame(
+      PHENOTYPE = phe$PHENOTYPE,
+      COVAR1 = cov$COVAR1,
+      GENOTYPE = snp$GENOTYPE
+    )
+
+    # Fit linear regression model
+    lm_model <- lm(PHENOTYPE ~ COVAR1 + GENOTYPE, data = df)
+
+    # Extract p-value for GENOTYPE
+    summary_lm <- summary(lm_model)
+    p_value <- summary_lm$coefficients["GENOTYPE", "Pr(>|t|)"]
+    beta <- summary_lm$coefficients["GENOTYPE", "Estimate"]
+
+    return(list(p_value = p_value, beta = beta))
+  }
+
+  for (m in modelli) {
+    print(paste("Model:", m))
+    pheno <- pheno_list[[m]]
+
+    # ADDED: Diagnostic plot to see phenotype distribution (optional)
+    # Uncomment to see before/after INT effects
+    # if (USE_INT && j == 1) {
+    #   png(paste0("phenotype_distribution_", m, "_seed", n.seed, ".png"))
+    #   par(mfrow=c(1,2))
+    #   hist(pheno$PHENOTYPE, main=paste("Original", m), breaks=50)
+    #   qqnorm(pheno$PHENOTYPE, main=paste("QQ-plot", m))
+    #   qqline(pheno$PHENOTYPE)
+    #   dev.off()
+    # }
+
+    # Linear regression analysis
+    is.effect.estimated = TRUE
+
+    # SPEED OPTIMIZATION: Use data.table for faster operations in parallel
+    clusterExport(main_cluster, c("pheno"), envir = environment())
+
+    # Parallel loop for linear regression
+    df.lr.parallel <- foreach(
+      idx.geno = 1:ncol(geno.mat),
+      .combine = function(...) {
+        # SPEED OPTIMIZATION: Use rbindlist for faster combining
+        data.table::rbindlist(list(...), fill = TRUE)
+      },
+      .packages = c("dplyr", "data.table"),
+      .errorhandling = "remove"
+    ) %dopar% {
+      # Create data frame for current SNP
+      df.reg <- data.frame(
+        PHENOTYPE = pheno$PHENOTYPE,
+        COVAR1 = pheno$COVAR1,
+        GENOTYPE = geno.mat[, idx.geno],
+        check.names = FALSE
+      )
+
+      # Perform linear regression test
+      result <- linear_regression_test(
+        phe = df.reg %>% select(PHENOTYPE),
+        cov = df.reg %>% select(COVAR1),
+        snp = df.reg %>% select(GENOTYPE)
+      )
+
+      # Create result row
+      result_row <- data.frame(
+        P_LR = result$p_value,
+        BETA_LR = result$beta,
+        stringsAsFactors = FALSE
+      )
+
+      # Return the row
+      result_row
+    }
+
+    # Convert back to data.frame if needed
+    if ("data.table" %in% class(df.lr.parallel)) {
+      df.lr <- as.data.frame(df.lr.parallel)
+    } else {
+      df.lr <- df.lr.parallel
+    }
+
+    colnames(df.lr) = c("P_LR", "BETA_LR")
+    df.lr = df.lr %>% mutate(ID = colnames(geno.mat), .before = 1)
+
+    # Apply FDR correction to p-values
+    df.lr$P_LR_corrected <- p.adjust(df.lr$P_LR, method = "fdr")
+
+    # Update confusion matrix using corrected p-values
+    model_name <- sub("y.", "", m)
+
+    significant <- df.lr$P_LR_corrected < 0.05
+    is_causal <- df.lr$ID %in% causal_ids
+
+    confusion_results[[model_name]]$TP <- confusion_results[[model_name]]$TP + sum(significant & is_causal, na.rm = TRUE)
+    confusion_results[[model_name]]$FP <- confusion_results[[model_name]]$FP + sum(significant & !is_causal, na.rm = TRUE)
+    confusion_results[[model_name]]$FN <- confusion_results[[model_name]]$FN + sum(!significant & is_causal, na.rm = TRUE)
+    confusion_results[[model_name]]$TN <- confusion_results[[model_name]]$TN + sum(!significant & !is_causal, na.rm = TRUE)
+
+    # Save results
+    int_suffix <- ifelse(USE_INT, "_INT", "")
+    data.table::fwrite(df.lr, paste0(m, "_linear_regression", int_suffix, "_seed_", n.seed, "_num_varianti_", Num_varianti, ".tsv"),
+                       sep = "\t", row.names = FALSE, quote = FALSE)
+
+  }  # End model loop
+
+  # Performance table for this iteration
+  perf_table <- data.frame(
+    Model = character(),
+    TP = integer(),
+    FP = integer(),
+    FN = integer(),
+    TN = integer(),
+    Power = numeric(),
+    Type_I_Error = numeric(),
+    Type_II_Error = numeric(),
+    Precision = numeric(),
+    F1_Score = numeric(),
+    stringsAsFactors = FALSE
+  )
+
+  for (model in models) {
+    cm <- confusion_results[[model]]
+
+    # Compute core metrics
+    power <- cm$TP / (cm$TP + cm$FN + 1e-8)
+    Type_I_Error <- cm$FP / (cm$FP + cm$TN + 1e-8)
+    Type_II_Error <- cm$FN / (cm$TP + cm$FN + 1e-8)
+    precision <- cm$TP / (cm$TP + cm$FP + 1e-8)
+    f1_score <- 2 * (precision * power) / (precision + power + 1e-8)
+
+    # Append row to the performance table
+    perf_table <- rbind(perf_table, data.frame(
+      Model = model,
+      TP = cm$TP,
+      FP = cm$FP,
+      FN = cm$FN,
+      TN = cm$TN,
+      Power = round(power, 4),
+      Type_I_Error = round(Type_I_Error, 4),
+      Type_II_Error = round(Type_II_Error, 4),
+      Precision = round(precision, 4),
+      F1_Score = round(f1_score, 4),
+      Iteration = j,
+      INT = USE_INT  # ADDED: Track whether INT was used
+    ))
+  }
+
+  # Store performance data for later aggregation
+  all_performance_data[[length(all_performance_data) + 1]] <- perf_table
+
+  # View table
+  print(perf_table)
+
+  # Save to CSV or TXT
+  int_suffix <- ifelse(USE_INT, "_INT", "")
+  filename <- paste0("performance_metrics_linear_regression", int_suffix, "_seed", j, ".txt")
+  write.table(perf_table, filename, row.names = FALSE, quote = FALSE, sep = "\t")
+
+  # SPEED OPTIMIZATION: Stop cluster after each iteration
+  stopCluster(main_cluster)
+  registerDoSEQ()
+}  # End iteration loop
+
+# After all iterations are complete, create boxplots
+if (length(all_performance_data) > 0) {
+  # Combine all performance data
+  all_perf_combined <- do.call(rbind, all_performance_data)
+
+  # Convert metrics to percentage for plotting
+  all_perf_combined <- all_perf_combined %>%
+    mutate(
+      Power_pct = Power * 100,
+      F1_Score_pct = F1_Score * 100,
+      Type_I_Error_pct = Type_I_Error * 100
+    )
+
+  # Define consistent color palette for the five models
+  model_colors <- c(
+    "hom" = "#1f77b4",       # blue
+    "cauchy" = "#ff7f0e",    # orange
+    "locscale" = "#2ca02c",  # green
+    "local" = "#d62728",     # red
+    "dom" = "#9467bd"        # purple
+  )
+
+  # ======== 1️⃣ POWER BOXPLOT ========
+  int_label <- ifelse(USE_INT, "with INT", "without INT")
+  p1 <- ggplot(
+    all_perf_combined,
+    aes(
+      x = Model,
+      y = Power_pct,
+      fill = Model
+    )
+  ) +
+    geom_boxplot(outlier.shape = 19, outlier.size = 1.5, alpha = 0.7) +
+    geom_jitter(
+      position = position_jitter(width = 0.2),
+      size = 0.8,
+      alpha = 0.5
+    ) +
+    scale_fill_manual(values = model_colors) +
+    labs(
+      title = paste("Distribution of Power (Linear Regression", int_label, ")"),
+      x = "Model",
+      y = "Power (%)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+
+  int_suffix <- ifelse(USE_INT, "_INT", "")
+  ggsave(
+    paste0("boxplot_power_linear_regression", int_suffix, ".png"),
+    p1,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+
+  # ======== 2️⃣ F1 SCORE BOXPLOT ========
+  p2 <- ggplot(
+    all_perf_combined,
+    aes(
+      x = Model,
+      y = F1_Score_pct,
+      fill = Model
+    )
+  ) +
+    geom_boxplot(outlier.shape = 19, outlier.size = 1.5, alpha = 0.7) +
+    geom_jitter(
+      position = position_jitter(width = 0.2),
+      size = 0.8,
+      alpha = 0.5
+    ) +
+    scale_fill_manual(values = model_colors) +
+    labs(
+      title = paste("Distribution of F1 Score (Linear Regression", int_label, ")"),
+      x = "Model",
+      y = "F1 Score (%)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+
+  ggsave(
+    paste0("boxplot_f1score_linear_regression", int_suffix, ".png"),
+    p2,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+
+  # ======== 3️⃣ TYPE I ERROR BOXPLOT ========
+  p3 <- ggplot(
+    all_perf_combined,
+    aes(
+      x = Model,
+      y = Type_I_Error_pct,
+      fill = Model
+    )
+  ) +
+    geom_boxplot(outlier.shape = 19, outlier.size = 1.5, alpha = 0.7) +
+    geom_jitter(
+      position = position_jitter(width = 0.2),
+      size = 0.8,
+      alpha = 0.5
+    ) +
+    scale_fill_manual(values = model_colors) +
+    labs(
+      title = paste("Distribution of Type I Error (Linear Regression", int_label, ")"),
+      x = "Model",
+      y = "Type I Error (%)"
+    ) +
+    theme_minimal(base_size = 14) +
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      plot.title = element_text(hjust = 0.5, face = "bold")
+    )
+
+  ggsave(
+    paste0("boxplot_typeIerror_linear_regression", int_suffix, ".png"),
+    p3,
+    width = 10,
+    height = 8,
+    dpi = 300
+  )
+
+  # Save the combined data for reference
+  int_suffix <- ifelse(USE_INT, "_INT", "")
+  write.table(all_perf_combined, paste0("all_performance_data_linear_regression", int_suffix, "_combined.txt"),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+
+  # Print summary statistics
+  cat("\n📊 Summary statistics across all iterations (Linear Regression", ifelse(USE_INT, "with INT", "without INT"), "):\n")
+  summary_stats <- all_perf_combined %>%
+    group_by(Model) %>%
+    summarise(
+      Mean_Power = mean(Power_pct, na.rm = TRUE),
+      SD_Power = sd(Power_pct, na.rm = TRUE),
+      Mean_F1 = mean(F1_Score_pct, na.rm = TRUE),
+      SD_F1 = sd(F1_Score_pct, na.rm = TRUE),
+      Mean_TypeI = mean(Type_I_Error_pct, na.rm = TRUE),
+      SD_TypeI = sd(Type_I_Error_pct, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  print(summary_stats)
+
+  # Save summary statistics
+  write.table(summary_stats, paste0("performance_summary_statistics_linear_regression", int_suffix, ".txt"),
+              sep = "\t", row.names = FALSE, quote = FALSE)
+}
+
+##
 ## Quantile regression with 10 significant SNPs
 ##
 
