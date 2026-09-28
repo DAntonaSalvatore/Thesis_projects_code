@@ -1775,5 +1775,746 @@ if (length(all_performance_data) > 0) {
 }
                
 # END OF SIMULATED DATA SECTION
-# START OF HUMAN DATA SECTION
+# START OF A. thaliana DATA SECTION
+
                
+##
+## Linear regression with 9 reference SNPs
+##
+
+library(doParallel)
+library(foreach)
+library(data.table)
+library(dplyr)
+library(QRank)
+library(quantreg)
+library(ggplot2)
+library(tidyr)
+
+
+options(scipen = 999)
+setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Quantile_Regression\\A_thaliana")
+
+# ============================================================
+# Load real A. thaliana FT10 data
+# ============================================================
+
+input <- fread("A_thaliana_TF10_NO_NA.txt")
+
+sample_ids <- input[[1]]
+phenotype  <- input[[2]]
+
+geno <- as.matrix(input[, 3:ncol(input)])
+colnames(geno) <- colnames(input)[3:ncol(input)]
+
+input <- NULL
+gc()
+
+cat("Samples:", nrow(geno), "\n")
+cat("SNPs:", ncol(geno), "\n")
+
+
+# ============================================================
+# Reference SNPs to be identified
+# ============================================================
+
+reference_snps <- c(
+  "Chr5_3188327",
+  "Chr4_288749",
+  "Chr1_24345355",
+  "Chr5_18613760",
+  "Chr2_11408771",
+  "Chr1_29817195",
+  "Chr2_9588628",
+  "Chr4_1114351",
+  "Chr4_226062"
+)
+
+missing <- setdiff(reference_snps, colnames(geno))
+if (length(missing) > 0) {
+  stop("Missing reference SNPs in genotype matrix: ",
+       paste(missing, collapse = ", "))
+}
+
+ref_geno <- geno[, reference_snps, drop = FALSE]
+is_mono  <- apply(ref_geno, 2, function(x) length(unique(x)) < 2)
+
+if (any(is_mono)) {
+  cat("\nMonomorphic reference SNPs (removed):\n")
+  for (s in reference_snps[is_mono]) {
+    cat("  -", s,
+        " (unique value:", unique(ref_geno[, s]), ")\n")
+  }
+  reference_snps <- reference_snps[!is_mono]
+}
+
+n_causal_snps <- length(reference_snps)
+
+cat("\nReference SNPs retained:", n_causal_snps, "\n")
+cat(paste0("  ", reference_snps, collapse = "\n"), "\n")
+
+
+# ============================================================
+# Parameters
+# ============================================================
+
+Num_varianti   <- 250
+N_RANDOM       <- Num_varianti - length(reference_snps)
+ult_iterazione <- 100
+FDR_THRESHOLD  <- 0.05
+
+# Candidate PC counts to compare
+N_PCS_GRID     <- c(4, 5)
+
+USE_INT <- TRUE
+
+
+# ============================================================
+# Rank-based Inverse Normal Transformation
+# ============================================================
+
+rank_INT <- function(x) {
+  n <- length(x)
+  r <- rank(x, ties.method = "average")
+  q <- (r - 0.375) / (n + 0.25)
+  qnorm(q)
+}
+
+
+# ============================================================
+# Apply INT if requested
+# ============================================================
+
+phenotype_original <- phenotype
+
+if (USE_INT) {
+  cat("Applying rank-based inverse normal transformation (INT) to FT10 phenotype\n")
+  if (any(is.infinite(phenotype))) {
+    phenotype[is.infinite(phenotype)] <-
+      sign(phenotype[is.infinite(phenotype)]) *
+      max(abs(phenotype[is.finite(phenotype)]), na.rm = TRUE) * 10
+  }
+  phenotype <- rank_INT(phenotype)
+}
+
+
+# ============================================================
+# PCA (once, genome-wide, EXCLUDING reference SNPs)
+# ============================================================
+
+cat("\nRunning PCA on genotype matrix (all SNPs except reference)...\n")
+
+snps_for_pca <- setdiff(colnames(geno), reference_snps)
+X_pca        <- geno[, snps_for_pca, drop = FALSE]
+
+cat("  SNPs used for PCA:", ncol(X_pca), "\n")
+
+pca <- prcomp(X_pca, center = TRUE, scale. = FALSE)
+
+## Keep all PCs; subset later per N_PCS value
+PCs_all <- pca$x
+
+## Diagnostic table (informational only)
+eig      <- pca$sdev^2
+prop_var <- eig / sum(eig)
+
+n_show <- min(10, length(eig))
+cat("\nVariance explained by first", n_show, "PCs:\n")
+print(data.frame(
+  PC                = seq_len(n_show),
+  Var_explained_pct = round(prop_var[seq_len(n_show)] * 100, 4),
+  Cumulative_pct    = round(cumsum(prop_var[seq_len(n_show)]) * 100, 4)
+))
+
+rm(X_pca, pca); gc()
+
+
+# ============================================================
+# Non-reference SNP pool
+# ============================================================
+
+non_ref_snps <- setdiff(colnames(geno), reference_snps)
+
+## ============================================================
+## Save feature sets for reproducibility (independent of seed)
+## ============================================================
+
+## 1. Fixed reference SNPs
+write.table(
+  data.table(SNP = reference_snps),
+  "reference_snps_used.tsv",
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+
+## 2. Pre-generate all random draws for all iterations
+##    (must be done once, before the loop, so both N_PCS runs
+##     use the identical background)
+set.seed(123)
+random_snps_matrix <- matrix(
+  NA_character_,
+  nrow = ult_iterazione,
+  ncol = N_RANDOM,
+  dimnames = list(paste0("Iter", seq_len(ult_iterazione)),
+                  paste0("SNP_", seq_len(N_RANDOM)))
+)
+for (j in seq_len(ult_iterazione)) {
+  set.seed(j)
+  random_snps_matrix[j, ] <- sample(non_ref_snps, N_RANDOM, replace = FALSE)
+}
+
+## 3. Save in two formats:
+##    - wide (one row per iteration, 241 columns)
+##    - long (one row per iteration-SNP pair, with a type column)
+fwrite(
+  data.table(Iteration = seq_len(ult_iterazione),
+             as.data.table(random_snps_matrix)),
+  "random_snps_per_iteration.tsv",
+  sep = "\t"
+)
+
+features_long <- rbindlist(lapply(seq_len(ult_iterazione), function(j) {
+  rbind(
+    data.table(Iteration = j, SNP = reference_snps,   Type = "reference"),
+    data.table(Iteration = j, SNP = random_snps_matrix[j, ], Type = "random")
+  )
+}))
+fwrite(features_long, "features_per_iteration.tsv", sep = "\t")
+
+cat("Non-reference SNPs available for random sampling:",
+    length(non_ref_snps), "\n")
+
+
+# ============================================================
+# Linear regression helper
+# ============================================================
+
+linear_regression_test <- function(phe, cov, snp) {
+  
+  df <- data.frame(
+    PHENOTYPE = phe$PHENOTYPE,
+    cov,
+    GENOTYPE = snp$GENOTYPE,
+    check.names = FALSE
+  )
+  
+  pc_names     <- colnames(cov)
+  formula_text <- paste(
+    "PHENOTYPE ~",
+    paste(c(pc_names, "GENOTYPE"), collapse = " + ")
+  )
+  
+  lm_model   <- lm(as.formula(formula_text), data = df)
+  summary_lm <- summary(lm_model)
+  
+  list(
+    p_value = summary_lm$coefficients["GENOTYPE", "Pr(>|t|)"],
+    beta    = summary_lm$coefficients["GENOTYPE", "Estimate"]
+  )
+}
+
+
+# ============================================================
+# Parallel cluster (setup once)
+# ============================================================
+
+ncores       <- detectCores()
+main_cluster <- makeCluster(ncores)
+registerDoParallel(main_cluster)
+
+
+# ============================================================
+# Storage for the comparison
+# ============================================================
+
+comparison_summary <- list()
+comparison_perf    <- list()
+
+
+# ============================================================
+# OUTER LOOP: N_PCS values to compare
+# ============================================================
+
+for (N_PCS in N_PCS_GRID) {
+  
+  cat("\n\n############################################################\n")
+  cat("RUNNING WITH N_PCS =", N_PCS, "\n")
+  cat("############################################################\n")
+  
+  ## Build pheno with first N_PCS PCs
+  PCs   <- PCs_all[, seq_len(N_PCS), drop = FALSE]
+  pheno <- data.frame(
+    IID       = sample_ids,
+    PHENOTYPE = phenotype,
+    PCs,
+    check.names = FALSE
+  )
+  
+  int_suffix <- ifelse(USE_INT, "_INT", "")
+  pcs_suffix <- paste0("_PCs", N_PCS)
+  run_tag    <- paste0(int_suffix, pcs_suffix)
+  
+  ## ---- Inner loop: 100 iterations ----
+  all_performance_data <- list()
+  all_results_data     <- list()
+  
+  for (j in seq_len(ult_iterazione)) {
+    
+    cat("\n----- [N_PCS =", N_PCS, "] Iteration", j, "/", ult_iterazione, "-----\n")
+    set.seed(j)
+    
+    ## 1. Draw 241 random SNPs
+    random_snps <- random_snps_matrix[j, ]
+    
+    ## 2. Build 250-SNP panel (9 reference + 241 random)
+    geno.mat <- cbind(
+      geno[, reference_snps, drop = FALSE],
+      geno[, random_snps,    drop = FALSE]
+    )
+    colnames(geno.mat) <- c(reference_snps, random_snps)
+    
+    ## 3. Export to workers
+    clusterExport(
+      main_cluster,
+      c("pheno", "linear_regression_test", "geno.mat", "N_PCS"),
+      envir = environment()
+    )
+    
+    ## 4. Per-SNP regression
+    df.lr.parallel <- foreach(
+      idx.geno = 1:ncol(geno.mat),
+      .combine = function(...) data.table::rbindlist(list(...), fill = TRUE),
+      .packages = c("dplyr", "data.table"),
+      .errorhandling = "remove"
+    ) %dopar% {
+      
+      snp <- data.frame(GENOTYPE = geno.mat[, idx.geno])
+      cov <- pheno[, paste0("PC", 1:N_PCS), drop = FALSE]
+      
+      result <- linear_regression_test(
+        phe = pheno[, "PHENOTYPE", drop = FALSE],
+        cov = cov,
+        snp = snp
+      )
+      
+      data.frame(
+        P_LR    = result$p_value,
+        BETA_LR = result$beta,
+        stringsAsFactors = FALSE
+      )
+    }
+    
+    ## 5. Convert and label
+    if ("data.table" %in% class(df.lr.parallel)) {
+      df.lr <- as.data.frame(df.lr.parallel)
+    } else {
+      df.lr <- df.lr.parallel
+    }
+    
+    colnames(df.lr) <- c("P_LR", "BETA_LR")
+    df.lr <- df.lr %>% mutate(ID = colnames(geno.mat), .before = 1)
+    
+    ## 6. FDR
+    df.lr$P_LR_corrected           <- p.adjust(df.lr$P_LR, method = "fdr")
+    df.lr$P_LR_nominal_significant <- df.lr$P_LR < 0.05
+    df.lr$FDR_significant          <- df.lr$P_LR_corrected < FDR_THRESHOLD
+    df.lr$Iteration                <- j
+    df.lr$N_PCS                    <- N_PCS
+    
+    ## 7. Confusion matrix
+    significant  <- df.lr$FDR_significant
+    is_reference <- df.lr$ID %in% reference_snps
+    
+    cm <- list(
+      TP = sum( significant &  is_reference, na.rm = TRUE),
+      FP = sum( significant & !is_reference, na.rm = TRUE),
+      FN = sum(!significant &  is_reference, na.rm = TRUE),
+      TN = sum(!significant & !is_reference, na.rm = TRUE)
+    )
+    
+    ## 8. Metrics
+    power     <- cm$TP / (cm$TP + cm$FN + 1e-8)
+    typeI     <- cm$FP / (cm$FP + cm$TN + 1e-8)
+    typeII    <- cm$FN / (cm$TP + cm$FN + 1e-8)
+    precision <- cm$TP / (cm$TP + cm$FP + 1e-8)
+    f1        <- 2 * precision * power / (precision + power + 1e-8)
+    
+    n_ref_testable <- sum(reference_snps %in% df.lr$ID)
+    power_nominal  <- sum(df.lr$P_LR_nominal_significant &
+                            df.lr$ID %in% reference_snps) /
+      (n_ref_testable + 1e-8)
+    
+    perf_table <- data.frame(
+      Model         = "FT10",
+      N_PCS         = N_PCS,
+      TP = cm$TP, FP = cm$FP, FN = cm$FN, TN = cm$TN,
+      Power         = round(power,         4),
+      Power_nominal = round(power_nominal, 4),
+      Type_I_Error  = round(typeI,         4),
+      Type_II_Error = round(typeII,        4),
+      Precision     = round(precision,     4),
+      F1_Score      = round(f1,            4),
+      Iteration     = j,
+      INT           = USE_INT
+    )
+    
+    all_performance_data[[j]] <- perf_table
+    all_results_data[[j]]     <- df.lr
+    
+    print(perf_table)
+    
+    ## 9. Save per-iteration outputs
+    data.table::fwrite(
+      df.lr,
+      paste0("FT10_linear_regression", run_tag,
+             "_seed_", j, "_num_varianti_", Num_varianti, ".tsv"),
+      sep = "\t", row.names = FALSE, quote = FALSE
+    )
+    
+    reference_results <- df.lr %>%
+      filter(ID %in% reference_snps) %>%
+      arrange(P_LR)
+    
+    data.table::fwrite(
+      reference_results,
+      paste0("FT10_reference_SNP_results", run_tag,
+             "_seed_", j, ".tsv"),
+      sep = "\t", row.names = FALSE, quote = FALSE
+    )
+  }
+  
+  ## ---- Aggregate for this N_PCS ----
+  perf_combined    <- do.call(rbind, all_performance_data)
+  results_combined <- do.call(rbind, all_results_data)
+  
+  data.table::fwrite(
+    perf_combined,
+    paste0("all_performance_data_linear_regression", run_tag, "_combined.txt"),
+    sep = "\t"
+  )
+  data.table::fwrite(
+    results_combined,
+    paste0("all_per_snp_results_linear_regression", run_tag, "_combined.txt"),
+    sep = "\t"
+  )
+  
+  ## ---- Summary for this N_PCS ----
+  ## NOTE: N_PCS is NOT referenced inside summarise() because the column
+  ## `N_PCS` already exists in perf_combined (100 rows) and would clash
+  ## with the outer scalar. We compute the metrics first, then attach the
+  ## scalar columns.
+  summary_stats <- perf_combined %>%
+    summarise(
+      Mean_Power     = mean(Power,          na.rm = TRUE),
+      SD_Power       = sd(Power,            na.rm = TRUE),
+      Mean_Power_nom = mean(Power_nominal,  na.rm = TRUE),
+      SD_Power_nom   = sd(Power_nominal,    na.rm = TRUE),
+      Mean_F1        = mean(F1_Score,       na.rm = TRUE),
+      SD_F1          = sd(F1_Score,         na.rm = TRUE),
+      Mean_TypeI     = mean(Type_I_Error,   na.rm = TRUE),
+      SD_TypeI       = sd(Type_I_Error,     na.rm = TRUE),
+      Mean_TypeII    = mean(Type_II_Error,  na.rm = TRUE),
+      Mean_Precision = mean(Precision,      na.rm = TRUE)
+    )
+  summary_stats$N_PCS       <- N_PCS
+  summary_stats$N_reference <- n_causal_snps
+  
+  ## Reorder so N_PCS comes first
+  summary_stats <- summary_stats %>%
+    select(N_PCS, Mean_Power, SD_Power, Mean_Power_nom, SD_Power_nom,
+           Mean_F1, SD_F1, Mean_TypeI, SD_TypeI, Mean_TypeII,
+           Mean_Precision, N_reference)
+  
+  cat("\n===== Summary for N_PCS =", N_PCS, "=====\n")
+  print(summary_stats)
+  
+  write.table(
+    summary_stats,
+    paste0("performance_summary_statistics_linear_regression", run_tag, ".txt"),
+    sep = "\t", row.names = FALSE, quote = FALSE
+  )
+  
+  comparison_summary[[as.character(N_PCS)]] <- summary_stats
+  comparison_perf[[as.character(N_PCS)]]    <- perf_combined
+}
+
+
+# ============================================================
+# Stop cluster
+# ============================================================
+
+stopCluster(main_cluster)
+registerDoSEQ()
+
+
+# ============================================================
+# Comparison across N_PCS values
+# ============================================================
+
+cat("\n\n############################################################\n")
+cat("COMPARISON OF N_PCS VALUES\n")
+cat("############################################################\n")
+
+comparison_df <- do.call(rbind, comparison_summary)
+print(comparison_df, row.names = FALSE)
+
+write.table(
+  comparison_df,
+  paste0("N_PCS_comparison_summary", int_suffix, ".txt"),
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+
+## Decide the winner by a combined criterion
+best_row <- comparison_df %>%
+  mutate(score = Mean_Power + Mean_Power_nom - Mean_TypeI) %>%
+  arrange(desc(score)) %>%
+  slice(1)
+
+cat("\n---- Best N_PCS by combined criterion (Power + Power_nom - TypeI) ----\n")
+cat("N_PCS =", best_row$N_PCS, "\n")
+cat("  Mean_Power       :", round(best_row$Mean_Power,     4), "\n")
+cat("  Mean_Power_nom   :", round(best_row$Mean_Power_nom, 4), "\n")
+cat("  Mean_F1          :", round(best_row$Mean_F1,        4), "\n")
+cat("  Mean_TypeI_Error :", round(best_row$Mean_TypeI,     4), "\n")
+
+
+# ============================================================
+# Combined boxplots across both N_PCS values
+# ============================================================
+
+all_combined <- do.call(rbind, comparison_perf)
+
+all_combined <- all_combined %>%
+  mutate(
+    Power_pct         = Power * 100,
+    Power_nominal_pct = Power_nominal * 100,
+    F1_Score_pct      = F1_Score * 100,
+    Type_I_Error_pct  = Type_I_Error * 100,
+    N_PCS_f           = factor(paste0("N_PCS = ", N_PCS),
+                               levels = paste0("N_PCS = ", N_PCS_GRID))
+  )
+
+int_label    <- ifelse(USE_INT, "with INT", "without INT")
+model_colors <- c("N_PCS = 4" = "#1f77b4",
+                  "N_PCS = 5" = "#ff7f0e")
+
+
+# ------------------------------------------------------------
+# Power boxplot
+# ------------------------------------------------------------
+p1 <- ggplot(all_combined,
+             aes(x = N_PCS_f, y = Power_pct, fill = N_PCS_f)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.5, alpha = 0.7) +
+  geom_jitter(position = position_jitter(width = 0.2),
+              size = 0.8, alpha = 0.5) +
+  scale_fill_manual(values = model_colors) +
+  labs(title = paste("Power (FDR) — Linear Regression", int_label),
+       x = NULL, y = "Power (%)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(paste0("boxplot_power_comparison", int_suffix, ".png"),
+       p1, width = 8, height = 6, dpi = 300)
+
+
+# ------------------------------------------------------------
+# Nominal power boxplot
+# ------------------------------------------------------------
+p1b <- ggplot(all_combined,
+              aes(x = N_PCS_f, y = Power_nominal_pct, fill = N_PCS_f)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.5, alpha = 0.7) +
+  geom_jitter(position = position_jitter(width = 0.2),
+              size = 0.8, alpha = 0.5) +
+  scale_fill_manual(values = model_colors) +
+  labs(title = paste("Nominal Power (P<0.05) — Linear Regression", int_label),
+       x = NULL, y = "Nominal Power (%)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(paste0("boxplot_power_nominal_comparison", int_suffix, ".png"),
+       p1b, width = 8, height = 6, dpi = 300)
+
+
+# ------------------------------------------------------------
+# F1 score boxplot
+# ------------------------------------------------------------
+p2 <- ggplot(all_combined,
+             aes(x = N_PCS_f, y = F1_Score_pct, fill = N_PCS_f)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.5, alpha = 0.7) +
+  geom_jitter(position = position_jitter(width = 0.2),
+              size = 0.8, alpha = 0.5) +
+  scale_fill_manual(values = model_colors) +
+  labs(title = paste("F1 Score — Linear Regression", int_label),
+       x = NULL, y = "F1 Score (%)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(paste0("boxplot_f1score_comparison", int_suffix, ".png"),
+       p2, width = 8, height = 6, dpi = 300)
+
+
+# ------------------------------------------------------------
+# Type I error boxplot
+# ------------------------------------------------------------
+p3 <- ggplot(all_combined,
+             aes(x = N_PCS_f, y = Type_I_Error_pct, fill = N_PCS_f)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.5, alpha = 0.7) +
+  geom_jitter(position = position_jitter(width = 0.2),
+              size = 0.8, alpha = 0.5) +
+  scale_fill_manual(values = model_colors) +
+  labs(title = paste("Empirical FP proportion — Linear Regression", int_label),
+       x = NULL, y = "Type I Error (%)") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none",
+        plot.title = element_text(hjust = 0.5, face = "bold"))
+
+ggsave(paste0("boxplot_typeIerror_comparison", int_suffix, ".png"),
+       p3, width = 8, height = 6, dpi = 300)
+
+
+
+# ============================================================
+# Combined boxplots: Power, F1, Type I Error in a single image
+# ============================================================
+
+plot_three <- all_combined %>%
+  select(N_PCS_f, Power_pct, F1_Score_pct, Type_I_Error_pct) %>%
+  pivot_longer(
+    cols = c(Power_pct, F1_Score_pct, Type_I_Error_pct),
+    names_to = "Metric",
+    values_to = "Value_pct"
+  ) %>%
+  mutate(
+    Metric = factor(
+      Metric,
+      levels = c("Power_pct", "F1_Score_pct", "Type_I_Error_pct"),
+      labels = c("Power (FDR)", "F1 Score", "Type I Error")
+    )
+  )
+
+p_combined <- ggplot(plot_three,
+                     aes(x = N_PCS_f, y = Value_pct, fill = N_PCS_f)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.2,
+               alpha = 0.7, width = 0.6) +
+  geom_jitter(position = position_jitter(width = 0.15),
+              size = 0.6, alpha = 0.45) +
+  facet_wrap(~ Metric, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = model_colors) +
+  labs(
+    title = paste("Linear Regression performance —", int_label),
+    x    = NULL,
+    y    = "%"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    strip.text      = element_text(face = "bold", size = 12)
+  )
+
+ggsave(
+  paste0("boxplot_power_F1_TypeI_combined", int_suffix, ".png"),
+  p_combined,
+  width  = 12,
+  height = 5,
+  dpi    = 300
+)
+
+# ============================================================
+# Boxplots of Power, F1 and Type I Error — N_PCS = 4 only
+# ============================================================
+
+## Keep only the N_PCS = 4 rows
+all_pcs4 <- all_combined %>%
+  filter(N_PCS == 4)
+
+## Reshape to long format for faceting
+plot_pcs4 <- all_pcs4 %>%
+  select(Power_pct, F1_Score_pct, Type_I_Error_pct) %>%
+  pivot_longer(
+    cols      = c(Power_pct, F1_Score_pct, Type_I_Error_pct),
+    names_to  = "Metric",
+    values_to = "Value_pct"
+  ) %>%
+  mutate(
+    Metric = factor(
+      Metric,
+      levels = c("Power_pct", "F1_Score_pct", "Type_I_Error_pct"),
+      labels = c("Power (FDR)", "F1 Score", "Type I Error")
+    )
+  )
+
+## Build the combined plot
+p_pcs4 <- ggplot(plot_pcs4,
+                 aes(x = Metric, y = Value_pct, fill = Metric)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.2,
+               alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.12, size = 0.6, alpha = 0.45) +
+  facet_wrap(~ Metric, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c(
+    "Power (FDR)"  = "#1f77b4",
+    "F1 Score"     = "#2ca02c",
+    "Type I Error" = "#d62728"
+  )) +
+  labs(
+    title = paste("Linear Regression"),
+    x     = NULL,
+    y     = "%"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x     = element_blank(),
+    strip.text      = element_text(face = "bold", size = 12)
+  )
+
+## Save
+ggsave(
+  paste0("boxplot_power_F1_TypeI_PCs4", int_suffix, ".png"),
+  p_pcs4,
+  width  = 11,
+  height = 5,
+  dpi    = 300
+)
+
+cat("\nSaved: boxplot_power_F1_TypeI_PCs4", int_suffix, ".png\n", sep = "")
+
+# ============================================================
+# Save combined data
+# ============================================================
+
+write.table(
+  all_combined,
+  paste0("all_performance_data_linear_regression_combined", int_suffix, ".txt"),
+  sep = "\t", row.names = FALSE, quote = FALSE
+)
+
+
+# ============================================================
+# Final report
+# ============================================================
+
+cat("\n============================================================\n")
+cat("Analysis completed.\n")
+cat("Reference SNPs analyzed:", n_causal_snps, "\n")
+cat("Total SNPs per iteration:", Num_varianti, "\n")
+cat("Random SNPs per iteration:", N_RANDOM, "\n")
+cat("Samples:", nrow(geno), "\n")
+cat("Iterations:", ult_iterazione, "\n")
+cat("N_PCS values compared:", paste(N_PCS_GRID, collapse = ", "), "\n")
+cat("FDR threshold:", FDR_THRESHOLD, "\n")
+cat("INT:", USE_INT, "\n")
+cat("============================================================\n")
+
+res <- fread("all_per_snp_results_linear_regression_INT_PCs4_combined.txt")
+res[Iteration == 1 & ID %in% reference_snps,
+    .(ID, P_LR, P_LR_corrected, BETA_LR, FDR_significant)][order(P_LR)]
+
+
+##
+## Quantile regression with 9 reference SNPs
+##
+
