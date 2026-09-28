@@ -518,7 +518,7 @@ if (length(all_performance_data) > 0) {
 
 ##
 ## Quantile regression with 10 significant SNPs
-##
+
 
 library(data.table)
 library(QRank)
@@ -2556,3 +2556,396 @@ res[Iteration == 1 & ID %in% reference_snps,
 ## Quantile regression with 9 reference SNPs
 ##
 
+
+library(data.table)
+library(QRank)
+library(quantreg)
+library(reshape2)
+library(viridis)
+library(gridExtra)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(parallel)
+library(doParallel)
+library(foreach)
+options(scipen = 999)
+
+setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Quantile_Regression\\A_thaliana")
+
+# ============================================================
+# 1. Load data
+# ============================================================
+cat("Loading genotype data...\n")
+input      <- fread("A_thaliana_TF10_NO_NA.txt")
+sample_ids <- input[[1]]
+geno       <- as.matrix(input[, 3:ncol(input)])
+colnames(geno) <- colnames(input)[3:ncol(input)]
+input <- NULL; gc()
+
+cat("Samples:", nrow(geno), "  SNPs:", ncol(geno), "\n")
+
+## Reference SNPs (9, fixed)
+reference_snps <- read.delim("reference_snps_used.tsv")$SNP
+n_ref <- length(reference_snps)
+cat("Reference SNPs:", n_ref, "\n")
+
+## Random SNPs matrix (100 x 241), pre-generated
+random_snps_wide <- fread("random_snps_per_iteration.tsv")
+
+## Covariates: IID + PC1..PC4
+covariates <- fread("covariates_PCs4.tsv")
+
+## Phenotype — toggle between INT and raw
+USE_INT_FOR_QR <- FALSE   # TRUE = INT phenotype, FALSE = original untransformed
+
+if (USE_INT_FOR_QR) {
+  pheno_used  <- fread("phenotype_used_INT.tsv")
+  pheno_label <- "INT"
+} else {
+  raw_input   <- fread("A_thaliana_TF10_NO_NA.txt", select = c(1, 2))
+  pheno_used  <- data.frame(IID       = raw_input[[1]],
+                            PHENOTYPE = raw_input[[2]])
+  pheno_label <- "raw"
+  rm(raw_input); gc()
+}
+cat("Phenotype used:", pheno_label, "\n")
+
+match_cov <- match(sample_ids, covariates$IID)
+match_phe <- match(sample_ids, pheno_used$IID)
+if (any(is.na(match_cov)) || any(is.na(match_phe))) {
+  stop("Sample IDs do not match between files.")
+}
+covariates <- covariates[match_cov, ]
+pheno_used <- pheno_used[match_phe, ]
+
+df_analysis <- data.frame(
+  IID       = sample_ids,
+  PHENOTYPE = pheno_used$PHENOTYPE,
+  covariates[, paste0("PC", 1:4), with = FALSE]
+)
+
+cat("Covariate + phenotype alignment done.\n")
+
+# ============================================================
+# 2. Parameters
+# ============================================================
+Num_varianti  <- 250
+N_RANDOM      <- ncol(random_snps_wide) - 1
+n_replicates  <- nrow(random_snps_wide)
+nq            <- 9
+qntl          <- seq(1, nq) / (nq + 1)
+FDR_THRESHOLD <- 0.05
+N_PCS         <- 4
+
+# ============================================================
+# 3. ACAT
+# ============================================================
+acat <- function(pvals) {
+  pvals = pvals[!is.na(pvals)]
+  if (length(pvals) == 0) return(NA)
+  pvals <- pmax(pmin(pvals, 1 - 1e-15), 1e-15)
+  cauchy = tanpi(0.5 - pvals)
+  stats  = mean(cauchy)
+  pcauchy(q = stats, lower.tail = FALSE)
+}
+
+# ============================================================
+# 4. QRank test
+# ============================================================
+qrank.test <- function(phe, cov, snp, fit.residual, tau) {
+  ltau = length(tau)
+  x = as.matrix(snp); y = as.matrix(phe); n <- nrow(y)
+  zz = cbind(rep(1, n), as.matrix(cov))
+  VN = outer(tau, tau, function(t1, t2) pmin(t1, t2) - t1 * t2)
+  xstar = lm(x ~ zz - 1)$residual
+  SN = NULL
+  for (i in 1:ltau) {
+    idx <- ((i - 1) * n + 1):(i * n)
+    ranks = 1 * (fit.residual$Residual[idx] > 0) - (1 - tau[i])
+    SN = c(SN, as.matrix(t(xstar) %*% ranks))
+  }
+  VN2 = VN * as.numeric(t(xstar) %*% xstar)
+  pvalue = pchisq(SN^2 / diag(VN2), 1, lower.tail = FALSE)
+  names(pvalue) = tau
+  list(tau = tau, quantile.pvalue = pvalue,
+       cauchy.pvalue = acat(pvalue))
+}
+
+# ============================================================
+# 5. Null QR residuals
+# ============================================================
+cat("Computing null QR residuals...\n")
+df.res <- data.frame(
+  Quantile = rep(qntl, each = nrow(df_analysis)),
+  IID      = rep(df_analysis$IID, times = length(qntl)),
+  Residual = numeric(length(qntl) * nrow(df_analysis))
+)
+fml.null <- paste("PHENOTYPE ~",
+                  paste(paste0("PC", 1:N_PCS), collapse = " + "))
+for (idx.qntl in seq_along(qntl)) {
+  fit.null = rq(as.formula(fml.null), tau = qntl[idx.qntl],
+                data = df_analysis, method = "fn")
+  idx <- ((idx.qntl - 1) * nrow(df_analysis) + 1):(idx.qntl * nrow(df_analysis))
+  df.res$Residual[idx] <- resid(fit.null)
+}
+cat("Null residuals computed.\n")
+
+# ============================================================
+# 6. Parallel cluster
+# ============================================================
+n_cores_available <- detectCores()
+n_cores <- as.numeric(Sys.getenv("N_CORES", min(8, n_cores_available - 4)))
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+clusterExport(cl,
+              c("df_analysis", "geno", "qntl", "df.res",
+                "qrank.test", "acat", "reference_snps", "N_PCS"),
+              envir = environment())
+clusterEvalQ(cl, {
+  library(quantreg); library(dplyr); library(data.table)
+})
+
+# ============================================================
+# 7. Main loop  <-- per-iteration writes now INSIDE the loop
+# ============================================================
+all_performance_data <- list()
+all_results_data     <- list()
+
+for (j in seq_len(n_replicates)) {
+  cat("\n===== Iteration", j, "/", n_replicates, "=====\n")
+  
+  random_snps_j <- as.character(random_snps_wide[j, -1, with = FALSE])
+  
+  geno.mat <- cbind(
+    geno[, reference_snps, drop = FALSE],
+    geno[, random_snps_j,  drop = FALSE]
+  )
+  colnames(geno.mat) <- c(reference_snps, random_snps_j)
+  
+  clusterExport(cl, "geno.mat", envir = environment())
+  
+  df.qr.parallel <- foreach(
+    idx.geno = 1:ncol(geno.mat),
+    .combine = function(...) data.table::rbindlist(list(...), fill = TRUE),
+    .packages = c("quantreg", "dplyr", "data.table"),
+    .errorhandling = "remove"
+  ) %dopar% {
+    df.qreg <- cbind(
+      data.frame(PHENOTYPE = df_analysis$PHENOTYPE),
+      df_analysis[, paste0("PC", 1:N_PCS)],
+      data.frame(GENOTYPE = geno.mat[, idx.geno])
+    )
+    fml.qreg <- paste("PHENOTYPE ~",
+                      paste(c(paste0("PC", 1:N_PCS), "GENOTYPE"),
+                            collapse = " + "))
+    beta <- double()
+    for (idx.qntl in seq_along(qntl)) {
+      qreg <- rq(as.formula(fml.qreg), tau = qntl[idx.qntl],
+                 data = df.qreg, method = "fn")
+      beta <- c(beta, qreg$coefficients["GENOTYPE"])
+    }
+    p <- qrank.test(
+      phe = df.qreg %>% select(PHENOTYPE),
+      cov = df.qreg %>% select(all_of(paste0("PC", 1:N_PCS))),
+      snp = df.qreg %>% select(GENOTYPE),
+      fit.residual = df.res, tau = qntl
+    )
+    data.frame(p$cauchy.pvalue, t(p$quantile.pvalue), t(beta),
+               stringsAsFactors = FALSE)
+  }
+  
+  if ("data.table" %in% class(df.qr.parallel)) {
+    df.qr <- as.data.frame(df.qr.parallel)
+  } else {
+    df.qr <- df.qr.parallel
+  }
+  
+  colnames(df.qr) <- c("P_QR",
+                       paste0("P_QR",    round(qntl, 3)),
+                       paste0("BETA_QR", round(qntl, 3)))
+  df.qr <- df.qr %>% mutate(ID = colnames(geno.mat), .before = 1)
+  df.qr$Iteration       <- j
+  df.qr$P_QR_corrected  <- p.adjust(df.qr$P_QR, method = "fdr")
+  df.qr$FDR_significant <- df.qr$P_QR_corrected < FDR_THRESHOLD
+  df.qr$is_reference    <- df.qr$ID %in% reference_snps
+  
+  significant  <- df.qr$FDR_significant
+  is_reference <- df.qr$is_reference
+  TP <- sum( significant &  is_reference, na.rm = TRUE)
+  FP <- sum( significant & !is_reference, na.rm = TRUE)
+  FN <- sum(!significant &  is_reference, na.rm = TRUE)
+  TN <- sum(!significant & !is_reference, na.rm = TRUE)
+  power     <- TP / (TP + FN + 1e-8)
+  typeI     <- FP / (FP + TN + 1e-8)
+  typeII    <- FN / (TP + FN + 1e-8)
+  precision <- TP / (TP + FP + 1e-8)
+  f1        <- 2 * precision * power / (precision + power + 1e-8)
+  n_ref_testable <- sum(reference_snps %in% df.qr$ID)
+  power_nominal  <- sum(df.qr$P_QR < 0.05 & df.qr$is_reference) /
+    (n_ref_testable + 1e-8)
+  
+  perf_table <- data.frame(
+    Model = "FT10", Iteration = j,
+    TP = TP, FP = FP, FN = FN, TN = TN,
+    Power         = round(power,         4),
+    Power_nominal = round(power_nominal, 4),
+    Type_I_Error  = round(typeI,         4),
+    Type_II_Error = round(typeII,        4),
+    Precision     = round(precision,     4),
+    F1_Score      = round(f1,            4),
+    N_quantiles   = nq
+  )
+  all_performance_data[[j]] <- perf_table
+  all_results_data[[j]]     <- df.qr
+  print(perf_table)
+  
+  ## ---- Per-iteration writes (NOW INSIDE THE LOOP) ----
+  fwrite(df.qr,
+         paste0("QR_replicate_", j,
+                "_pheno_", pheno_label,
+                "_num_quantili_", nq,
+                "_num_varianti_", Num_varianti, ".tsv"),
+         sep = "\t")
+  
+  reference_results <- df.qr %>%
+    filter(ID %in% reference_snps) %>%
+    arrange(P_QR)
+  
+  fwrite(reference_results,
+         paste0("QR_reference_SNP_results_pheno_", pheno_label,
+                "_seed_", j, ".tsv"),
+         sep = "\t")
+}
+
+stopCluster(cl)
+registerDoSEQ()
+
+# ============================================================
+# 8. Aggregate
+# ============================================================
+all_performance_data <- do.call(rbind, all_performance_data)
+all_results_combined <- do.call(rbind, all_results_data)
+
+summary_stats <- all_performance_data %>%
+  summarise(
+    Mean_Power     = mean(Power,          na.rm = TRUE),
+    SD_Power       = sd(Power,            na.rm = TRUE),
+    Mean_Power_nom = mean(Power_nominal,  na.rm = TRUE),
+    SD_Power_nom   = sd(Power_nominal,    na.rm = TRUE),
+    Mean_F1        = mean(F1_Score,       na.rm = TRUE),
+    SD_F1          = sd(F1_Score,         na.rm = TRUE),
+    Mean_TypeI     = mean(Type_I_Error,   na.rm = TRUE),
+    SD_TypeI       = sd(Type_I_Error,     na.rm = TRUE),
+    Mean_TypeII    = mean(Type_II_Error,  na.rm = TRUE),
+    Mean_Precision = mean(Precision,      na.rm = TRUE),
+    N_reference    = n_ref
+  )
+print(summary_stats)
+
+fwrite(all_performance_data,
+       paste0("ALL_QR_iteration_performance_data_pheno_", pheno_label, ".tsv"),
+       sep = "\t")
+fwrite(all_results_combined,
+       paste0("all_per_snp_QR_results_combined_pheno_", pheno_label, ".tsv"),
+       sep = "\t")
+write.table(summary_stats,
+            paste0("QR_performance_summary_statistics_pheno_", pheno_label, ".txt"),
+            row.names = FALSE, quote = FALSE, sep = "\t")
+
+# ============================================================
+# 9. Boxplots (with paste0 filenames)
+# ============================================================
+all_perf_pct <- all_performance_data %>%
+  mutate(
+    Power_pct         = Power * 100,
+    Power_nominal_pct = Power_nominal * 100,
+    F1_Score_pct      = F1_Score * 100,
+    Type_I_Error_pct  = Type_I_Error * 100
+  )
+
+make_box <- function(df, col, title, fill) {
+  ggplot(df, aes(x = "", y = .data[[col]])) +
+    geom_boxplot(fill = fill, alpha = 0.7,
+                 outlier.shape = 19, outlier.size = 1.5) +
+    geom_jitter(width = 0.15, size = 0.8, alpha = 0.5) +
+    labs(title = title, x = NULL, y = "%") +
+    theme_minimal(base_size = 14) +
+    theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+}
+
+ggsave(paste0("boxplot_power_QR_pheno_", pheno_label, ".png"),
+       make_box(all_perf_pct, "Power_pct",
+                "Distribution of Power — QR", "#1f77b4"),
+       width = 6, height = 6, dpi = 300)
+
+ggsave(paste0("boxplot_power_nominal_QR_pheno_", pheno_label, ".png"),
+       make_box(all_perf_pct, "Power_nominal_pct",
+                "Distribution of Nominal Power — QR", "#9467bd"),
+       width = 6, height = 6, dpi = 300)
+
+ggsave(paste0("boxplot_f1score_QR_pheno_", pheno_label, ".png"),
+       make_box(all_perf_pct, "F1_Score_pct",
+                "Distribution of F1 Score — QR", "#2ca02c"),
+       width = 6, height = 6, dpi = 300)
+
+ggsave(paste0("boxplot_typeIerror_QR_pheno_", pheno_label, ".png"),
+       make_box(all_perf_pct, "Type_I_Error_pct",
+                "Distribution of Empirical FP proportion — QR", "#d62728"),
+       width = 6, height = 6, dpi = 300)
+
+plot_long <- all_perf_pct %>%
+  select(Power_pct, F1_Score_pct, Type_I_Error_pct) %>%
+  pivot_longer(everything(), names_to = "Metric", values_to = "Value") %>%
+  mutate(Metric = factor(
+    Metric,
+    levels = c("Power_pct", "F1_Score_pct", "Type_I_Error_pct"),
+    labels = c("Power (FDR)", "F1 Score", "Type I Error")
+  ))
+
+p_combined <- ggplot(plot_long, aes(x = Metric, y = Value, fill = Metric)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.2,
+               alpha = 0.7, width = 0.5) +
+  geom_jitter(width = 0.12, size = 0.6, alpha = 0.45) +
+  facet_wrap(~ Metric, scales = "free_y", nrow = 1) +
+  scale_fill_manual(values = c(
+    "Power (FDR)"  = "#1f77b4",
+    "F1 Score"     = "#2ca02c",
+    "Type I Error" = "#d62728"
+  )) +
+  labs(title = paste0("QR performance — N_PCS = 4, ",
+                      ifelse(USE_INT_FOR_QR, "INT", "raw"), " phenotype"),
+       x = NULL, y = "%") +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    plot.title      = element_text(hjust = 0.5, face = "bold"),
+    axis.text.x     = element_blank(),
+    strip.text      = element_text(face = "bold", size = 12)
+  )
+
+ggsave(paste0("boxplot_power_F1_TypeI_combined_QR_pheno_", pheno_label, ".png"),
+       p_combined, width = 11, height = 5, dpi = 300)
+
+cat("\nAll outputs saved (phenotype =", pheno_label, ").\n")
+
+# ============================================================
+# 10. Diagnostic — merge QR vs LR (uses correct filename)
+# ============================================================
+qr  <- fread(paste0("all_per_snp_QR_results_combined_pheno_",
+                    pheno_label, ".tsv"))
+lr  <- fread("all_per_snp_results_linear_regression_INT_PCs4_combined.txt")
+ref <- read.delim("reference_snps_used.tsv")$SNP
+
+qr_ref <- qr[Iteration == 1 & ID %in% ref,
+             .(ID, P_QR, FDR_significant)]
+lr_ref <- lr[Iteration == 1 & ID %in% ref,
+             .(ID, P_LR, FDR_significant)]
+
+merged <- merge(qr_ref, lr_ref, by = "ID",
+                suffixes = c("_QR", "_LR"))
+print(merged)
+
+##
+## Cluster-based regression with 9 significant SNPs
+##
