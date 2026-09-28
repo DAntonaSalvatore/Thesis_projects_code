@@ -2949,3 +2949,384 @@ print(merged)
 ##
 ## Cluster-based regression with 9 significant SNPs
 ##
+
+library(doParallel)
+library(foreach)
+library(data.table)
+library(dplyr)
+library(QRank)
+library(quantreg)
+library(ggplot2)
+options(scipen = 999)
+
+setwd(getwd())
+
+# ============================================================
+# 1. Load data
+# ============================================================
+cat("Loading genotype data...\n")
+input      <- fread("A_thaliana_TF10_NO_NA.txt")
+sample_ids <- input[[1]]
+geno       <- as.matrix(input[, 3:ncol(input)])
+colnames(geno) <- colnames(input)[3:ncol(input)]
+raw_pheno  <- input[[2]]                    # RAW (non-INT) phenotype
+input <- NULL; gc()
+
+cat("Samples:", nrow(geno), "  SNPs:", ncol(geno), "\n")
+
+## Reference SNPs (9, fixed)
+reference_snps <- read.delim("reference_snps_used.tsv")$SNP
+n_ref <- length(reference_snps)
+cat("Reference SNPs:", n_ref, "\n")
+
+## Random SNP panels (100 x 241)
+random_snps_wide <- fread("random_snps_per_iteration.tsv")
+
+## Covariates (IID + PC1..PC4)
+covariates <- fread("covariates_PCs4.tsv")
+match_cov  <- match(sample_ids, covariates$IID)
+if (any(is.na(match_cov))) stop("IID mismatch in covariates.")
+covariates <- covariates[match_cov, ]
+
+## Analysis dataframe
+df_analysis <- data.frame(
+  IID       = sample_ids,
+  PHENOTYPE = raw_pheno,
+  covariates[, paste0("PC", 1:4), with = FALSE]
+)
+
+cat("Data aligned. Phenotype is RAW (non-INT).\n")
+
+# ============================================================
+# 2. Parameters
+# ============================================================
+Num_varianti  <- 250
+N_RANDOM      <- ncol(random_snps_wide) - 1        # 241
+ult_iterazione <- nrow(random_snps_wide)           # 100
+FDR_THRESHOLD <- 0.05
+N_PCS         <- 4
+
+## Cap the k-means grid at the number of distinct phenotype values
+n_unique_pheno <- length(unique(df_analysis$PHENOTYPE))
+cat("Distinct phenotype values:", n_unique_pheno, "\n")
+
+cluster_sizes <- seq(3, min(100, n_unique_pheno), by = 1)
+cat("k-means grid:", min(cluster_sizes), "to", max(cluster_sizes),
+    "(", length(cluster_sizes), "values)\n")
+
+# ============================================================
+# 3. ACAT + QRank test (unchanged)
+# ============================================================
+acat <- function(pvals) {
+  pvals = pvals[!is.na(pvals)]
+  if (length(pvals) == 0) return(NA)
+  pvals <- pmax(pmin(pvals, 1 - 1e-15), 1e-15)
+  cauchy = tanpi(0.5 - pvals)
+  stats  = mean(cauchy)
+  pcauchy(q = stats, lower.tail = FALSE)
+}
+
+qrank.test <- function(phe, cov, snp, fit.residual, tau) {
+  ltau = length(tau)
+  x = as.matrix(snp); y = as.matrix(phe); n <- nrow(y)
+  zz = cbind(rep(1, n), as.matrix(cov))
+  VN = outer(tau, tau, function(t1, t2) pmin(t1, t2) - t1 * t2)
+  xstar = lm(x ~ zz - 1)$residual
+  SN = NULL
+  for (i in 1:ltau) {
+    idx <- ((i - 1) * n + 1):(i * n)
+    ranks = 1 * (fit.residual$Residual[idx] > 0) - (1 - tau[i])
+    SN = c(SN, as.matrix(t(xstar) %*% ranks))
+  }
+  VN2 = VN * as.numeric(t(xstar) %*% xstar)
+  pvalue = pchisq(SN^2 / diag(VN2), 1, lower.tail = FALSE)
+  names(pvalue) = tau
+  list(tau = tau, quantile.pvalue = pvalue,
+       cauchy.pvalue = acat(pvalue))
+}
+
+# ============================================================
+# 4. Storage
+# ============================================================
+all_performance_data <- list()
+
+# ============================================================
+# 5. Main iteration loop
+# ============================================================
+for (j in seq_len(ult_iterazione)) {
+
+  cat("\n============================================================\n")
+  cat(">> Iteration", j, "/", ult_iterazione, "\n")
+  cat("============================================================\n")
+
+  ## Random SNPs for this iteration
+  random_snps_j <- as.character(random_snps_wide[j, -1, with = FALSE])
+
+  ## Build 250-SNP matrix
+  geno.mat <- cbind(
+    geno[, reference_snps, drop = FALSE],
+    geno[, random_snps_j,  drop = FALSE]
+  )
+  colnames(geno.mat) <- c(reference_snps, random_snps_j)
+
+  ## Parallel cluster (per iteration, as in original)
+  ncores       <- detectCores()
+  main_cluster <- makeCluster(ncores)
+  registerDoParallel(main_cluster)
+
+  clusterExport(main_cluster, c("qrank.test", "acat", "df_analysis",
+                                "N_PCS"),
+                envir = environment())
+
+  clusterEvalQ(main_cluster, {
+    library(quantreg); library(dplyr); library(data.table)
+  })
+
+  # ============================================================
+  # Inner loop: k-means cluster sizes
+  # ============================================================
+  for (k in cluster_sizes) {
+
+    ## Reset confusion results for this (j, k)
+    confusion_results <- list(
+      FT10 = list(TP = 0, FP = 0, FN = 0, TN = 0)
+    )
+
+    cat("\n  Cluster k =", k, "\n")
+
+    y <- df_analysis$PHENOTYPE
+
+    ## K-means on the phenotype
+    kmeans_result <- kmeans(
+      y,
+      centers   = k,
+      iter.max  = 500,
+      nstart    = 10,
+      algorithm = "MacQueen"
+    )
+
+    ## Empirical CDF of phenotype
+    ecdf_func <- ecdf(y)
+
+    ## Sort centroids and convert to tau levels
+    centroids <- sapply(sort(unique(kmeans_result$cluster)), function(cl) {
+      mean(y[kmeans_result$cluster == cl])
+    })
+    centroids_sorted <- sort(centroids)
+    tau_levels       <- ecdf_func(centroids_sorted)
+    tau_levels       <- pmax(pmin(tau_levels, 0.99), 0.01)
+
+    ## Diagnostic (as in original)
+    cat("    Unique clusters found:", length(unique(kmeans_result$cluster)),
+        "| Unique tau levels:", length(unique(tau_levels)), "\n")
+
+    ## Pre-allocate residual data frame
+    df.res <- data.frame(
+      Quantile = rep(tau_levels, each = nrow(df_analysis)),
+      IID      = rep(df_analysis$IID, times = length(tau_levels)),
+      Residual = numeric(length(tau_levels) * nrow(df_analysis))
+    )
+
+    ## Null model: PHENOTYPE ~ PC1 + PC2 + PC3 + PC4
+    fml.null <- paste("PHENOTYPE ~",
+                      paste(paste0("PC", 1:N_PCS), collapse = " + "))
+    for (idx.qntl in seq_along(tau_levels)) {
+      fit.null = rq(as.formula(fml.null),
+                    tau = tau_levels[idx.qntl],
+                    data = df_analysis,
+                    method = "fn")
+      idx <- ((idx.qntl - 1) * nrow(df_analysis) + 1):
+             (idx.qntl * nrow(df_analysis))
+      df.res$Residual[idx] <- resid(fit.null)
+    }
+
+    ## Export per-k objects
+    clusterExport(main_cluster,
+                  c("geno.mat", "tau_levels", "df.res"),
+                  envir = environment())
+
+    ## Parallel QRank over all 250 SNPs
+    df.qr.parallel <- foreach(
+      idx.geno = 1:ncol(geno.mat),
+      .combine = function(...) data.table::rbindlist(list(...), fill = TRUE),
+      .packages = c("quantreg", "dplyr", "data.table"),
+      .errorhandling = "remove"
+    ) %dopar% {
+
+      df.qreg <- cbind(
+        data.frame(PHENOTYPE = df_analysis$PHENOTYPE),
+        df_analysis[, paste0("PC", 1:N_PCS)],
+        data.frame(GENOTYPE = geno.mat[, idx.geno])
+      )
+
+      ## Per-quantile QR coefficients
+      beta <- double()
+      fml.qreg <- paste("PHENOTYPE ~",
+                        paste(c(paste0("PC", 1:N_PCS), "GENOTYPE"),
+                              collapse = " + "))
+      for (idx.qntl in seq_along(tau_levels)) {
+        qreg <- rq(as.formula(fml.qreg),
+                   tau = tau_levels[idx.qntl],
+                   data = df.qreg,
+                   method = "fn")
+        beta <- c(beta, qreg$coefficients["GENOTYPE"])
+      }
+
+      ## QRank test
+      p <- qrank.test(
+        phe          = df.qreg %>% select(PHENOTYPE),
+        cov          = df.qreg %>% select(all_of(paste0("PC", 1:N_PCS))),
+        snp          = df.qreg %>% select(GENOTYPE),
+        fit.residual = df.res,
+        tau          = tau_levels
+      )
+
+      data.frame(
+        p$cauchy.pvalue,
+        t(p$quantile.pvalue),
+        t(beta),
+        stringsAsFactors = FALSE
+      )
+    }
+
+    if ("data.table" %in% class(df.qr.parallel)) {
+      df.qr <- as.data.frame(df.qr.parallel)
+    } else {
+      df.qr <- df.qr.parallel
+    }
+
+    ## Column names: use sorted centroid values as labels (raw-phenotype units)
+    qntl_labels <- round(centroids_sorted, 3)
+    colnames(df.qr) <- c("P_QR",
+                         paste0("P_QR",   qntl_labels),
+                         paste0("BETA_QR", qntl_labels))
+    df.qr <- df.qr %>% mutate(ID = colnames(geno.mat), .before = 1)
+
+    ## FDR on the combined p-value
+    df.qr$P_QR_corrected <- p.adjust(df.qr$P_QR, method = "fdr")
+    df.qr$FDR_significant <- df.qr$P_QR_corrected < FDR_THRESHOLD
+    df.qr$is_reference    <- df.qr$ID %in% reference_snps
+
+    ## Confusion matrix
+    significant  <- df.qr$FDR_significant
+    is_reference <- df.qr$is_reference
+
+    TP <- sum( significant &  is_reference, na.rm = TRUE)
+    FP <- sum( significant & !is_reference, na.rm = TRUE)
+    FN <- sum(!significant &  is_reference, na.rm = TRUE)
+    TN <- sum(!significant & !is_reference, na.rm = TRUE)
+
+    power     <- TP / (TP + FN + 1e-8)
+    typeI     <- FP / (FP + TN + 1e-8)
+    typeII    <- FN / (TP + FN + 1e-8)
+    precision <- TP / (TP + FP + 1e-8)
+    f1        <- 2 * precision * power / (precision + power + 1e-8)
+
+    perf_table <- data.frame(
+      Model         = "FT10",
+      Iteration     = j,
+      N_clusters    = k,
+      TP = TP, FP = FP, FN = FN, TN = TN,
+      Power         = round(power,     4),
+      Type_I_Error  = round(typeI,     4),
+      Type_II_Error = round(typeII,    4),
+      Precision     = round(precision, 4),
+      F1_Score      = round(f1,        4)
+    )
+    print(perf_table)
+
+    all_performance_data[[length(all_performance_data) + 1]] <- perf_table
+
+    ## Save per-(j,k) results
+    fwrite(df.qr,
+           paste0("QR_kmeans_seed_", j, "_k", k,
+                  "_num_varianti_", Num_varianti,
+                  "_pheno_raw.tsv"),
+           sep = "\t")
+
+    rm(df.res); gc()
+  }  # end k-means cluster-size loop
+
+  stopCluster(main_cluster)
+  registerDoSEQ()
+}  # end iteration loop
+
+# ============================================================
+# 6. Aggregate + save
+# ============================================================
+all_perf_combined <- do.call(rbind, all_performance_data)
+
+fwrite(all_perf_combined,
+       "ALL_QR_kmeans_performance_pheno_raw.tsv",
+       sep = "\t")
+
+summary_stats <- all_perf_combined %>%
+  group_by(N_clusters) %>%
+  summarise(
+    Mean_Power    = mean(Power,        na.rm = TRUE),
+    SD_Power      = sd(Power,          na.rm = TRUE),
+    Mean_F1       = mean(F1_Score,     na.rm = TRUE),
+    SD_F1         = sd(F1_Score,       na.rm = TRUE),
+    Mean_TypeI    = mean(Type_I_Error, na.rm = TRUE),
+    SD_TypeI      = sd(Type_I_Error,   na.rm = TRUE),
+    .groups = "drop"
+  )
+print(summary_stats)
+write.table(summary_stats,
+            "QR_kmeans_summary_pheno_raw.txt",
+            row.names = FALSE, quote = FALSE, sep = "\t")
+
+# ============================================================
+# 7. Plots (performance vs k)
+# ============================================================
+all_perf_combined <- all_perf_combined %>%
+  mutate(
+    Power_pct        = Power        * 100,
+    F1_Score_pct     = F1_Score     * 100,
+    Type_I_Error_pct = Type_I_Error * 100,
+    N_clusters_f     = factor(N_clusters)
+  )
+
+## Power vs k
+p1 <- ggplot(all_perf_combined,
+             aes(x = N_clusters_f, y = Power_pct)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.2,
+               fill = "#1f77b4", alpha = 0.7) +
+  scale_x_discrete(drop = FALSE) +
+  labs(title = "Power vs k (raw phenotype)",
+       x = "Number of clusters (k)", y = "Power (%)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6),
+        plot.title  = element_text(hjust = 0.5, face = "bold"))
+ggsave("boxplot_power_vs_k_pheno_raw.png",
+       p1, width = 14, height = 5, dpi = 300)
+
+## F1 vs k
+p2 <- ggplot(all_perf_combined,
+             aes(x = N_clusters_f, y = F1_Score_pct)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.2,
+               fill = "#2ca02c", alpha = 0.7) +
+  scale_x_discrete(drop = FALSE) +
+  labs(title = "F1 Score vs k (raw phenotype)",
+       x = "Number of clusters (k)", y = "F1 Score (%)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6),
+        plot.title  = element_text(hjust = 0.5, face = "bold"))
+ggsave("boxplot_f1score_vs_k_pheno_raw.png",
+       p2, width = 14, height = 5, dpi = 300)
+
+## Type I vs k
+p3 <- ggplot(all_perf_combined,
+             aes(x = N_clusters_f, y = Type_I_Error_pct)) +
+  geom_boxplot(outlier.shape = 19, outlier.size = 1.2,
+               fill = "#d62728", alpha = 0.7) +
+  scale_x_discrete(drop = FALSE) +
+  labs(title = "Empirical FP proportion vs k (raw phenotype)",
+       x = "Number of clusters (k)", y = "Type I Error (%)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, size = 6),
+        plot.title  = element_text(hjust = 0.5, face = "bold"))
+ggsave("boxplot_typeIerror_vs_k_pheno_raw.png",
+       p3, width = 14, height = 5, dpi = 300)
+
+cat("\nAll outputs saved.\n")
