@@ -1914,6 +1914,43 @@ pca <- prcomp(X_pca, center = TRUE, scale. = FALSE)
 ## Keep all PCs; subset later per N_PCS value
 PCs_all <- pca$x
 
+# ============================================================
+# Save covariates (PCs) for downstream analyses (e.g. QR)
+# ============================================================
+
+## Full PC matrix (all components)
+fwrite(
+  data.table(IID = sample_ids, as.data.table(PCs_all)),
+  "covariates_PCs_all.tsv",
+  sep = "\t"
+)
+
+## Convenience copies: first 4 and first 5 PCs (the ones actually used)
+fwrite(
+  data.table(IID = sample_ids,
+             as.data.table(PCs_all[, 1:4, drop = FALSE])),
+  "covariates_PCs4.tsv",
+  sep = "\t"
+)
+
+fwrite(
+  data.table(IID = sample_ids,
+             as.data.table(PCs_all[, 1:5, drop = FALSE])),
+  "covariates_PCs5.tsv",
+  sep = "\t"
+)
+
+## Also save the phenotype used in the regression (post-INT),
+## so QR sees the identical response variable
+fwrite(
+  data.table(IID = sample_ids, PHENOTYPE = phenotype),
+  paste0("phenotype_used", ifelse(USE_INT, "_INT", ""), ".tsv"),
+  sep = "\t"
+)
+
+cat("Saved covariates: covariates_PCs_all.tsv, covariates_PCs4.tsv, covariates_PCs5.tsv\n")
+cat("Saved phenotype:", paste0("phenotype_used", ifelse(USE_INT, "_INT", ""), ".tsv"), "\n")
+
 ## Diagnostic table (informational only)
 eig      <- pca$sdev^2
 prop_var <- eig / sum(eig)
@@ -2512,6 +2549,7 @@ cat("============================================================\n")
 res <- fread("all_per_snp_results_linear_regression_INT_PCs4_combined.txt")
 res[Iteration == 1 & ID %in% reference_snps,
     .(ID, P_LR, P_LR_corrected, BETA_LR, FDR_significant)][order(P_LR)]
+
 
 
 ##
