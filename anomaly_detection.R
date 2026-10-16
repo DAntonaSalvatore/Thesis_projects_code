@@ -1097,4 +1097,337 @@ pheatmap(
   width = 10,
   height = 12
 )
+
+                 
+# ============================================================
+# armonizzazione UKB (GRCh37) <-> external (GRCh38) (effettuato per i dataset di parkinson e demenza)
+#
+# Input:
+#   ukb_subset_to_rsid : variant, rsid, beta, other_allele, effect_allele
+#                        Convenzione UKB: effect_allele = ALT, other_allele = REF
+#                        e beta e' riferito a effect_allele.
+#   external           : rsid, effect_allele, other_allele, beta, se, pval
+#                        Convenzione external: effect_allele = ALT, other_allele = REF
+#                        MA il beta e' riferito a other_allele (= REF),
+#                        nonostante il nome della colonna. FIX applicato sotto.
+#   external_part      : contiene chromosome, base_pair_location, rsid
+#                        (usato solo per recuperare le posizioni hg38)
+#
+# Assunzioni:
+#   - UKB summary stats sono sullo strand + di GRCh37
+#   - external e' su GRCh38
+#   - entrambi i beta sono su scala log-odds (ln OR)
+# ============================================================
+
+suppressPackageStartupMessages({
+  library(data.table)
+  library(rtracklayer)
+  library(GenomicRanges)
+  library(BSgenome.Hsapiens.UCSC.hg38)
+  library(R.utils)
+})
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+complement <- function(x) chartr("ACGT", "TGCA", x)
+
+is_clean_snp <- function(a, b) {
+  a %chin% c("A","C","G","T") &
+    b %chin% c("A","C","G","T") &
+    a != b
+}
+
+hg38_ref_base <- function(chr, pos) {
+  gr <- GRanges(seqnames = chr, ranges = IRanges(start = pos, width = 1))
+  as.character(getSeq(BSgenome.Hsapiens.UCSC.hg38, gr))
+}
+
+report <- function(...) cat(sprintf(...), "\n")
+
+# ============================================================
+# 0. Diagnostico preliminare (opzionale)
+#    Determina quale colonna di external_part e' il REF genomico
+# ============================================================
+
+if (FALSE) {  # metti TRUE se vuoi rieseguirlo
+  set.seed(1)
+  samp <- external_part[sample(.N, min(100000L, .N))]
+  samp[, genome_ref := hg38_ref_base(paste0("chr", chromosome),
+                                     as.integer(base_pair_location))]
+  print(samp[, .(
+    eff_eq_ref   = mean(effect_allele == genome_ref,             na.rm = TRUE),
+    oth_eq_ref   = mean(other_allele  == genome_ref,             na.rm = TRUE),
+    eff_eq_compl = mean(effect_allele == complement(genome_ref), na.rm = TRUE),
+    oth_eq_compl = mean(other_allele  == complement(genome_ref), na.rm = TRUE)
+  )])
+}
+
+# ============================================================
+# 1. UKB: parse, filtraggio, liftover GRCh37 -> GRCh38
+# ============================================================
+
+ukb <- as.data.table(ukb_subset_to_rsid)
+
+ukb[, c("chr37","pos37","ref37","alt37") :=
+      tstrsplit(variant, ":", fixed = TRUE)]
+ukb[, `:=`(chr37 = paste0("chr", chr37),
+           pos37 = as.integer(pos37))]
+
+n0  <- nrow(ukb)
+ukb <- ukb[!is.na(pos37) & is_clean_snp(ref37, alt37)]
+report("UKB: %d / %d biallelic SNPs kept", nrow(ukb), n0)
+
+# rsid univoco
+ukb[, rsid_n := .N, by = rsid]
+ukb <- ukb[rsid_n == 1L][, rsid_n := NULL]
+
+# --- Liftover ------------------------------------------------
+
+chain_gz  <- tempfile(fileext = ".chain.gz")
+chain_url <- paste0(
+  intToUtf8(104), "ttps://hgdownload.soe.ucsc.edu/",
+  "goldenPath/hg19/liftOver/hg19ToHg38.over.chain.gz"
+)
+download.file(chain_url, chain_gz, mode = "wb")
+stopifnot(system2("gzip", c("-t", chain_gz)) == 0)
+
+chain_plain <- sub("\\.gz$", "", chain_gz)
+R.utils::gunzip(chain_gz, destname = chain_plain,
+                remove = FALSE, overwrite = TRUE)
+chain <- rtracklayer::import.chain(chain_plain, format = "chain")
+
+gr37   <- GRanges(ukb$chr37, IRanges(ukb$pos37, width = 1), strand = "+")
+lifted <- liftOver(gr37, chain)
+nmap   <- lengths(lifted)
+report("Liftover: %d / %d mapped uniquely", sum(nmap == 1L), length(nmap))
+
+keep <- which(nmap == 1L)
+ukb  <- ukb[keep]
+gr38 <- unlist(lifted[keep])
+
+ukb[, `:=`(chr38       = as.character(seqnames(gr38)),
+           pos38       = start(gr38),
+           lift_strand = as.character(strand(gr38)))]
+
+# --- Rinomino esplicito a *_38 prima della complementazione ---
+
+ukb[, `:=`(ref38    = ref37,
+           alt38    = alt37,
+           effect38 = effect_allele,
+           other38  = other_allele)]
+
+minus <- ukb$lift_strand == "-"
+report("Liftover: %d variants on - strand (complemented)", sum(minus))
+
+ukb[minus, `:=`(ref38    = complement(ref38),
+                alt38    = complement(alt38),
+                effect38 = complement(effect38),
+                other38  = complement(other38))]
+
+# --- REF check vs BSgenome hg38 -------------------------------
+
+ukb[, genome_ref := hg38_ref_base(chr38, pos38)]
+pct_ref_ok <- ukb[, 100 * mean(ref38 == genome_ref)]
+report("UKB: ref38 == hg38 reference in %.2f%%", pct_ref_ok)
+
+ukb <- ukb[ref38 == genome_ref]
+
+# Unicita' posizione
+ukb[, pos_n := .N, by = .(chr38, pos38)]
+report("UKB: %d posizioni multi-variante (dropped)",
+       ukb[pos_n > 1L, uniqueN(paste(chr38, pos38))])
+ukb <- ukb[pos_n == 1L][, pos_n := NULL]
+
+ukb[, c("lift_strand","chr37","pos37","ref37","alt37") := NULL]
+
+# ============================================================
+# 2. External: arricchimento posizioni da external_part
+#    Convenzione external: effect_allele = ALT, other_allele = REF
+#    MA beta e' riferito a other_allele (REF), non a effect_allele.
+#    >>> FIX: flip del segno di beta <<<
+# ============================================================
+
+pos_map <- unique(external_part[, .(
+  rsid,
+  chr38 = paste0("chr", chromosome),
+  pos38 = as.integer(base_pair_location)
+)])
+
+pos_map[, n := .N, by = rsid]
+n_amb <- pos_map[n > 1L, .N]
+report("external_part: %d rsid con posizioni multiple (dropped)", n_amb)
+pos_map <- pos_map[n == 1L][, n := NULL]
+
+ext <- merge(as.data.table(external), pos_map, by = "rsid", all.x = FALSE)
+
+setnames(ext, c("effect_allele","other_allele"),
+         c("effect_ext",  "other_ext"))
+
+# --- FIX: portare beta sulla convenzione "effect_allele" -------
+# Il file external ha beta riferito a other_ext (= REF). Flippo il
+# segno in modo che beta sia riferito a effect_ext (= ALT), come in UKB.
+
+report("External: flip del segno di beta (era riferito a other_allele)")
+ext[, beta := -beta]
+
+# --- Filtro SNP puliti ----------------------------------------
+
+n0  <- nrow(ext)
+ext <- ext[is_clean_snp(effect_ext, other_ext) & !is.na(pos38)]
+report("External: %d / %d SNP validi con posizione", nrow(ext), n0)
+
+ext[, pos_n := .N, by = .(chr38, pos38)]
+report("External: %d posizioni multi-variante (dropped)",
+       ext[pos_n > 1L, uniqueN(paste(chr38, pos38))])
+ext <- ext[pos_n == 1L][, pos_n := NULL]
+
+# ============================================================
+# 3. Merge per posizione (chr38 + pos38)
+# ============================================================
+
+setnames(ukb, "beta", "beta_ukb")
+
+merged <- merge(ukb, ext, by = c("chr38", "pos38"),
+                all = FALSE, suffixes = c("_ukb", "_ext"))
+report("Merged su chr38:pos38: %d varianti", nrow(merged))
+
+merged[, rsid_ok := rsid_ukb == rsid_ext]
+pct_rsid_ok <- merged[, 100 * mean(rsid_ok)]
+report("Merged: rsid coerente in %.2f%%", pct_rsid_ok)
+merged <- merged[rsid_ok == TRUE][, rsid_ok := NULL]
+
+# ============================================================
+# 4. Ancoraggio dell'external allo strand + di hg38
+#    other_ext e' il REF -> confronto con genome_ref
+# ============================================================
+
+merged[, ext_strand := fcase(
+  other_ext == genome_ref,             "+",
+  other_ext == complement(genome_ref), "-",
+  default = NA_character_
+)]
+
+cat("\nExternal strand calls:\n")
+print(table(merged$ext_strand, useNA = "ifany"))
+pct_called <- merged[, 100 * mean(!is.na(ext_strand))]
+report("External strand assignment: %.2f%% chiamate su %d varianti",
+       pct_called, nrow(merged))
+
+merged <- merged[!is.na(ext_strand)]
+
+# Se external fosse su -, complemento gli alleli (NON il beta: la
+# complementazione non cambia a quale allele il beta si riferisce)
+flip_ext <- merged$ext_strand == "-"
+merged[flip_ext, `:=`(effect_ext = complement(effect_ext),
+                      other_ext  = complement(other_ext))]
+
+setnames(merged, c("effect_ext","other_ext"),
+         c("effect_ext_p","other_ext_p"))
+
+# ============================================================
+# 5. Match same / swapped e flip di beta_ukb
+# ============================================================
+
+merged[, match_type := fcase(
+  effect38 == effect_ext_p & other38 == other_ext_p, "same",
+  effect38 == other_ext_p  & other38 == effect_ext_p, "swapped",
+  default = "incompatible"
+)]
+
+cat("\nMatch type distribution:\n")
+print(table(merged$match_type, useNA = "ifany"))
+
+merged[, beta_ukb_aligned := fcase(
+  match_type == "same",    beta_ukb,
+  match_type == "swapped", -beta_ukb,
+  default = NA_real_
+)]
+
+aligned <- merged[match_type %chin% c("same","swapped") &
+                    is.finite(beta_ukb_aligned) &
+                    is.finite(beta)]
+
+# ============================================================
+# 6. Concordanza (zeri esclusi dal denominatore)
+# ============================================================
+
+tol <- 1e-8
+
+aligned[, zero_pair := abs(beta_ukb_aligned) < tol | abs(beta) < tol]
+nz <- aligned[zero_pair == FALSE]
+nz[, concordant := sign(beta_ukb_aligned) == sign(beta)]
+
+cat("\nConcordanza sui soli beta non nulli:\n")
+print(nz[, .(
+  n              = .N,
+  concordant     = sum(concordant),
+  discordant     = sum(!concordant),
+  concordance_pc = round(100 * mean(concordant), 2)
+)])
+
+report("SNP con almeno un beta nullo (esclusi): %d", sum(aligned$zero_pair))
+
+cat("\nDettaglio per match_type:\n")
+print(nz[, .(
+  n              = .N,
+  concordance_pc = round(100 * mean(concordant), 2)
+), by = match_type])
+
+# --- Pearson + Lin's CCC --------------------------------------
+
+lin_ccc <- function(x, y) {
+  2 * cov(x, y) / (var(x) + var(y) + (mean(x) - mean(y))^2)
+}
+pearson <- nz[, cor(beta_ukb_aligned, beta)]
+ccc     <- nz[, lin_ccc(beta_ukb_aligned, beta)]
+report("Pearson r = %.4f   Lin's CCC = %.4f", pearson, ccc)
+
+# --- Concordanza sui SNP significativi di external -------------
+
+sig <- nz[pval < 5e-8]
+report("SNP significativi external (p<5e-8): n=%d, concordanza %.2f%%",
+       nrow(sig),
+       sig[, 100 * mean(sign(beta_ukb_aligned) == sign(beta))])
+report("Pearson r sui significativi: %.4f",
+       sig[, cor(beta_ukb_aligned, beta, use = "complete.obs")])
+
+# --- Concordanza per bin di |beta_ext| ------------------------
+
+nz[, bin := cut(abs(beta),
+                breaks = quantile(abs(beta), probs = seq(0, 1, 0.1)),
+                include.lowest = TRUE)]
+cat("\nConcordanza per bin di |beta_ext|:\n")
+print(nz[, .(
+  n              = .N,
+  concordance_pc = round(100 * mean(concordant), 2)
+), by = bin][order(bin)])
+
+# --- Palindromic SNPs: check separato -------------------------
+
+nz[, palindromic :=
+     paste0(pmin(effect38, other38), pmax(effect38, other38)) %chin%
+     c("AT","CG")]
+
+cat("\nPalindromic SNPs retained:\n")
+print(nz[, .(
+  n              = .N,
+  concordance_pc = round(100 * mean(concordant), 2)
+), by = palindromic])
+
+# ============================================================
+# 7. Salvataggio
+# ============================================================
+
+snps_concordant <- nz[concordant == TRUE]
+fwrite(snps_concordant, "SNPs_beta_concordant.csv")
+report("Saved %d concordant SNPs to SNPs_beta_concordant.csv",
+       nrow(snps_concordant))
+
+## confronto UKB vs gwas catalog
+input <- read.delim("heatmap_mat_info.txt")
+setnames(input, 1, "rsid_ext")
+confrontati <- merge(input, snps_concordant, by = "rsid_ext")
+
                  
