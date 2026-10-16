@@ -1127,6 +1127,23 @@ suppressPackageStartupMessages({
   library(R.utils)
 })
 
+setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Anomaly_Detection\\Validation_Anomaly_detection")
+#repeat the following steps for each phenotype
+external_preproc <- fread("DEMENTIA_GRCh38_preprocessed.tsv")
+external_part <- fread("dementia_h_raw.tsv")
+
+external_part2.0 <- external_part[,c(9,3,4)]
+setnames(external_preproc, 1, "rsid")
+external <- merge(external_part2.0, external_preproc, by = "rsid")
+ukb <- fread("F5_DEMENTIA.gwas.imputed_v3.both_sexes.tsv.bgz")
+
+ukb[, c("other_allele", "effect_allele") := tstrsplit(variant, ":", fixed = TRUE)[3:4]]
+ukb_subset <- ukb[, .(variant, beta, other_allele, effect_allele)]
+
+
+vocabolario <- fread("variants_col_selected.txt")
+ukb_subset_to_rsid <- merge(vocabolario, ukb_subset, by = "variant")                 
+                 
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
