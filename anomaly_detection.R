@@ -11,7 +11,7 @@ library(enrichR)
 
 
 
-setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Anomaly_Detection")
+setwd(getwd())
 
 # ---------------------------------------------------------------------
 # 1. Read and merge the five datasets
@@ -170,7 +170,7 @@ prune_snps <- function(variant_ids, vocabulary, method_name) {
   
   prune_input <- data.table(SNP = unique(dt$rsid))
   
-  setwd("C:\\Users\\Salvatore\\Desktop\\Plink 1.9")
+  setwd(getwd())
   
   write.table(
     prune_input,
@@ -815,8 +815,7 @@ print(random_baseline)
 # 17. Write final outputs
 # ---------------------------------------------------------------------
 
-setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Anomaly_Detection")
-
+setwd(getwd())
 #write.table(validated_snps2.0,
 #            "Validated_Anomalous_SNPs.txt",
 #            row.names = FALSE,
@@ -1040,7 +1039,7 @@ UpSetR::upset(
 dev.off()
 
 # Validation with other daasets
-setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Anomaly_Detection\\DROPPED_Validation_Anomaly_detection")
+setwd(getwd())
 #heatmap_mat <- cbind(
 #  variant = rownames(heatmap_mat),
 #  as.data.frame(heatmap_mat)
@@ -1127,7 +1126,7 @@ suppressPackageStartupMessages({
   library(R.utils)
 })
 
-setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Anomaly_Detection\\Validation_Anomaly_detection")
+setwd(getwd())
 #repeat the following steps for each phenotype
 external_preproc <- fread("DEMENTIA_GRCh38_preprocessed.tsv")
 external_part <- fread("dementia_h_raw.tsv")
