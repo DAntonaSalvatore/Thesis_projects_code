@@ -14,7 +14,6 @@ library(dplyr)
 library(ggplot2)
 options(scipen = 999)
 setwd(getwd())
-#setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Quantile_Regression\\Nuovi_dati_tutorial_Laza\\prova_CR_funzionera\\temporaneo_eliminare")
 load("simulation.RData")
 
 # ============================================
@@ -1150,7 +1149,6 @@ library(dplyr)
 library(ggplot2)
 options(scipen = 999)
 setwd(getwd())
-#setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Quantile_Regression\\Nuovi_dati_tutorial_Laza\\prova_CR_funzionera")
 load("simulation.RData")
 Num_varianti <- 250 # in origine 250
 ult_iterazione = 100 # in origine 100
@@ -1793,8 +1791,7 @@ library(tidyr)
 
 
 options(scipen = 999)
-setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Quantile_Regression\\A_thaliana")
-
+setwd(getwd())
 # ============================================================
 # Load real A. thaliana FT10 data
 # ============================================================
@@ -2571,8 +2568,7 @@ library(doParallel)
 library(foreach)
 options(scipen = 999)
 
-setwd("C:\\Users\\Salvatore\\Desktop\\Dottorato\\studio_DL\\Quantile_Regression\\A_thaliana")
-
+setwd(getwd())
 # ============================================================
 # 1. Load data
 # ============================================================
